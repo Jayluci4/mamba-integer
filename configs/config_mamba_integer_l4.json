@@ -1,0 +1,21 @@
+{
+  "architectures": [
+    "MambaIntegerL4"
+  ],
+  "d_model": 768,
+  "n_layer": 24,
+  "vocab_size": 4096,
+  "ssm_cfg": {
+    "d_state": 16,
+    "dt_rank": 48,
+    "dt_min": 0.001,
+    "dt_max": 0.1,
+    "use_dyadic_scan": true,
+    "scale_bits": 15
+  },
+  "rms_norm_eps": 1e-05,
+  "use_bitshift_norm": true,
+  "use_square_activation": true,
+  "weight_quantization": "bitnet_1.58",
+  "model_type": "mamba_integer"
+}
