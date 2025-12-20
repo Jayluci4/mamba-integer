@@ -2,7 +2,7 @@
 
 Mamba-Integer is a research-grade implementation of a purely integer-native State Space Model (SSM). By replacing transcendental operations (Exp, Sin, Cos, Sqrt) with algebraic equivalents (Shifts, Adds, Polynomials), Mamba-Integer enables high-performance, verifiable AI inference compatible with Zero-Knowledge (ZK) proofs and Fully Homomorphic Encryption (FHE).
 
-## 🚀 Key Features
+## Key Features
 
 *   **Dyadic-Cayley Transform:** Hardware-friendly spectral transforms using the 3-shear lifting scheme.
 *   **Integer-Only Selective Scan:** Linear recurrence implemented via dyadic rational multipliers, eliminating `exp()` bottlenecks.
@@ -10,7 +10,7 @@ Mamba-Integer is a research-grade implementation of a purely integer-native Stat
 *   **BitNet Integration:** Compatible with 1.58-bit ternary weights for massive memory savings.
 *   **Custom CUDA Kernels:** Optimized high-performance kernels for Dyadic Scan, BitShift Norm, and Square Activation.
 
-## 📂 Repository Structure
+## Repository Structure
 
 *   `src/`: Core implementation of Dyadic-Cayley components and the Mamba-Integer model.
     *   `cuda_kernels/`: Pure CUDA C++ implementations of algebraic primitives.
@@ -19,7 +19,7 @@ Mamba-Integer is a research-grade implementation of a purely integer-native Stat
 *   `tests/`: Stress tests and verification scripts against ground truth implementations.
 *   `configs/`: Model architecture definitions.
 
-## 🛠 Setup
+## Setup
 
 ### Prerequisites
 *   NVIDIA GPU (L4 or better recommended)
@@ -33,7 +33,7 @@ nvcc -shared -Xcompiler -fPIC -o libdyadic_mamba.so dyadic_mamba_kernel.cu
 # Repeat for other kernels
 ```
 
-## 📖 Usage
+## Usage
 
 ### Training from Scratch
 ```bash
@@ -45,8 +45,3 @@ python scripts/train_mamba_integer.py
 python scripts/surgery_dyadic.py --model_id <hf_model_id>
 ```
 
-## 📜 License
-MIT
-
-## 📧 Contact
-[Your Name/Organization]
