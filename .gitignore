@@ -31,6 +31,7 @@ archive/
 *.mo
 *.pot
 scripts/*.pt
+mamba-integer/scripts/*.pt
 # Django stuff:
 *.log
 local_settings.py
