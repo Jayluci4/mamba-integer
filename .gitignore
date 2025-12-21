@@ -137,3 +137,4 @@ scripts/*.jsonl
 *.log
 nohup.out
 mamba-integer/scripts/metrics.jsonl
+*.pt
