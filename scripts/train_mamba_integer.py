@@ -49,6 +49,7 @@ class BinaryDataset(Dataset):
 
 def train():
     print("--- High Efficiency Mamba-Integer-L4 Training ---")
+    torch.set_float32_matmul_precision('high')
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 1. Model
@@ -63,7 +64,9 @@ def train():
         return
         
     dataset = BinaryDataset(bin_path, seq_len=512)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=2, pin_memory=True)
+    # num_workers=0 avoids torch.compile deadlocks and is fast enough for mmap
+    # BS=4 is safer for L4 VRAM (24GB)
+    dataloader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
     
     # 3. Optimizer: Stiff Memory Protocol
     decay_params = []
@@ -74,19 +77,21 @@ def train():
         else:
             other_params.append(param)
             
+    # Boosted LR: 1e-3 for BitNet is standard
     optimizer = optim.AdamW([
-        {'params': decay_params, 'lr': 5e-2, 'weight_decay': 0.0},
-        {'params': other_params, 'lr': 1e-4, 'weight_decay': 0.01}
+        {'params': decay_params, 'lr': 1e-1, 'weight_decay': 0.0},
+        {'params': other_params, 'lr': 1e-3, 'weight_decay': 0.01}
     ])
     
     total_opt_steps = 15000
-    gradient_accumulation_steps = 16
+    gradient_accumulation_steps = 16 # Total Batch 64
     
+    # Linear Warmup + Cosine
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=[5e-2, 1e-4], 
+        max_lr=[1e-1, 1e-3], 
         total_steps=total_opt_steps, 
-        pct_start=0.06,
+        pct_start=0.05,
         anneal_strategy='cos',
         div_factor=10.0,
         final_div_factor=100.0
@@ -103,7 +108,7 @@ def train():
     start_time = time.time()
     optimizer.zero_grad()
     
-    print(f"Starting High-Speed Loop (Effective Batch: 32)...")
+    print(f"Starting High-Speed Loop (Effective Batch: 64)...")
     
     data_iter = iter(dataloader)
     
