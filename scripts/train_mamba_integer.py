@@ -65,7 +65,7 @@ def train():
             input_ids.append(torch.tensor(ids))
         return torch.stack(input_ids)
         
-    dataloader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn) # Reduced from 8
+    dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn) # Reduced to 2 for memory safety without checkpointing
     # Streaming dataset is iterable.
     # Convert to iterable dataloader logic.
     
@@ -73,9 +73,13 @@ def train():
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
     
+    # Monitor
+    from monitor import DyadicMonitor
+    monitor = DyadicMonitor()
+    
     # 4. Loop
     model.train()
-    total_steps = 15000 # Increased for full training
+    total_steps = 15000 # Full Training
     start_time = time.time()
     
     print("Starting Training Loop...")
@@ -104,8 +108,16 @@ def train():
         if step % 10 == 0:
             elapsed = time.time() - start_time
             print(f"Step {step}/{total_steps} | Loss: {loss.item():.4f} | Time: {elapsed:.2f}s")
+            monitor.log_step(step, model, loss.item())
+            
+        if step > 0 and step % 500 == 0:
+            ckpt_path = f"mamba_integer_step_{step}.pt"
+            torch.save(model.state_dict(), ckpt_path)
+            print(f"Saved checkpoint: {ckpt_path}")
             
     print("Training Complete.")
+    torch.save(model.state_dict(), "mamba_integer_final.pt")
+    print("Saved final model: mamba_integer_final.pt")
     
     # 5. Generation Test
     print("\n--- Generation Test ---")
