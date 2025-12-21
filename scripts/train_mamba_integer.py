@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -8,38 +7,30 @@ from mamba_integer_model import MambaIntegerModel
 import json
 import time
 import os
+import sys
+
+# Add path for src
+sys.path.insert(0, os.path.dirname(__file__))
+# Add parent for dyadic_hippo etc
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config_mamba_integer_l4.json")
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
-# --- Tokenizer (Simple Character Level for Proof of Concept) ---
-# Or load a pretrained one. Since vocab is 4096, we can use a BPE.
-# For simplicity and speed, let's use a char-level tokenizer if we don't have a BPE handy.
-# Or better: Use GPT-2 tokenizer and limit vocab?
-# Let's use a simple custom tokenizer for TinyStories.
-
-class SimpleTokenizer:
-    def __init__(self, vocab_size=4096):
-        self.vocab_size = vocab_size
-        self.char_to_idx = {}
-        self.idx_to_char = {}
-        # Basic ASCII
-        for i in range(256):
-            c = chr(i)
-            self.char_to_idx[c] = i
-            self.idx_to_char[i] = c
-            
-    def encode(self, text):
-        # Fallback to ASCII bytes
-        return [min(b, self.vocab_size - 1) for b in text.encode('utf-8')]
-        
-    def decode(self, ids):
-        return bytes([i for i in ids if i < 256]).decode('utf-8', errors='ignore')
+# --- Rust Tokenizer ---
+from rust_tokenizer import get_rust_tokenizer
+MERGES_PATH = os.path.join(os.path.dirname(__file__), "rust_bpe_merges.txt")
+rust_tokenizer = get_rust_tokenizer()
+if os.path.exists(MERGES_PATH):
+    print(f"Loading merges from {MERGES_PATH}")
+    rust_tokenizer.load(MERGES_PATH)
+else:
+    print("WARNING: merges file not found. Running with empty vocab!")
 
 def train():
-    print("--- Training Mamba-Integer-L4 on TinyStories ---")
+    print("--- Training Mamba-Integer-L4 on TinyStories (Rust BPE) ---")
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
@@ -51,23 +42,19 @@ def train():
     # 2. Data
     print("Loading TinyStories...")
     dataset = load_dataset("roneneldan/TinyStories", split="train", streaming=True)
-    tokenizer = SimpleTokenizer(config['vocab_size'])
     
     def collate_fn(batch):
-        # Dynamic padding or fixed length
         max_len = 512
         input_ids = []
         for item in batch:
-            ids = tokenizer.encode(item['text'])[:max_len]
+            ids = rust_tokenizer.encode(item['text'])[:max_len]
             # Pad
             if len(ids) < max_len:
                 ids += [0] * (max_len - len(ids))
             input_ids.append(torch.tensor(ids))
         return torch.stack(input_ids)
         
-    dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn) # Reduced to 2 for memory safety without checkpointing
-    # Streaming dataset is iterable.
-    # Convert to iterable dataloader logic.
+    dataloader = DataLoader(dataset, batch_size=2, collate_fn=collate_fn)
     
     # 3. Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=1e-4)
@@ -79,14 +66,13 @@ def train():
     
     # 4. Loop
     model.train()
-    total_steps = 15000 # Full Training
+    total_steps = 15000 
     start_time = time.time()
     
     print("Starting Training Loop...")
     for step, batch in enumerate(dataloader):
         if step >= total_steps: break
         
-        # Prepare inputs
         inputs = batch.to(device)
         targets = inputs.clone()
         
@@ -94,7 +80,6 @@ def train():
         logits = model(inputs)
         
         # Shift for loss
-        # logits: [B, L, V], targets: [B, L]
         shift_logits = logits[:, :-1, :].contiguous().view(-1, config['vocab_size'])
         shift_targets = targets[:, 1:].contiguous().view(-1)
         
@@ -117,23 +102,21 @@ def train():
             
     print("Training Complete.")
     torch.save(model.state_dict(), "mamba_integer_final.pt")
-    print("Saved final model: mamba_integer_final.pt")
     
     # 5. Generation Test
     print("\n--- Generation Test ---")
     model.eval()
     prompt = "Once upon a time"
-    input_ids = torch.tensor([tokenizer.encode(prompt)]).to(device)
+    input_ids = torch.tensor([rust_tokenizer.encode(prompt)]).to(device)
     
     generated = input_ids
     for _ in range(50):
         logits = model(generated)
-        next_token_logits = logits[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
         generated = torch.cat([generated, next_token], dim=-1)
         
     print(f"Prompt: {prompt}")
-    print(f"Output: {tokenizer.decode(generated[0].tolist())}")
+    print(f"Output: {rust_tokenizer.decode(generated[0].tolist())}")
 
 if __name__ == "__main__":
     train()
