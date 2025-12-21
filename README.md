@@ -71,6 +71,7 @@ cd src/cpp_engine
 nvcc -o mamba_infer mamba_infer.cpp -L../cuda_kernels -ldyadic_mamba -lbitshift_norm -lsquareplus -lbitlinear -lconv1d_step
 ./mamba_infer
 ```
+### 4. We ought to build the tokenizer preferably in rust which supports C/C++ and requires minimal effort to build
 
 ## 📜 License
 See `LICENSE` file. Strictly proprietary.
