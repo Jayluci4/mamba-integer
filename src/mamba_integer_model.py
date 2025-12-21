@@ -22,8 +22,14 @@ def load_lib(name):
 
 lib_bitshift = load_lib("bitshift_norm")
 lib_squareplus = load_lib("squareplus")
-lib_scan_path = os.path.join(os.path.dirname(__file__), "cuda/libdyadic_mamba.so")
-lib_scan = ctypes.CDLL(lib_scan_path) if os.path.exists(lib_scan_path) else None
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), "triton_kernels"))
+from dyadic_scan import dyadic_scan_triton
+
+# Setup library path for custom CUDA kernels
+LIB_PATH = os.path.join(os.path.dirname(__file__), "cuda_kernels/libdyadic_mamba.so")
+lib_scan = ctypes.CDLL(LIB_PATH) if os.path.exists(LIB_PATH) else None
 
 # --- Autograd Functions ---
 
@@ -124,15 +130,8 @@ class DyadicScanFunction(torch.autograd.Function):
         d_n_c = decay_nums_float.contiguous().int()
         d_s_c = decay_shifts.contiguous().int()
         
-        if lib_scan and u.is_cuda:
-            lib_scan.launch_dyadic_scan(
-                ctypes.c_void_p(u_c.data_ptr()),
-                ctypes.c_void_p(d_n_c.data_ptr()),
-                ctypes.c_void_p(d_s_c.data_ptr()),
-                ctypes.c_void_p(h.data_ptr()),
-                ctypes.c_int(B), ctypes.c_int(L), ctypes.c_int(D),
-                ctypes.c_int(scale_bits)
-            )
+        if u.is_cuda:
+            h = dyadic_scan_triton(u_c, d_n_c, d_s_c, scale_bits)
         else:
             scale = 2.0**scale_bits
             h_curr = torch.zeros(B, D, device=u.device)
@@ -185,9 +184,8 @@ class BitShiftNorm(nn.Module):
         x = x - x.mean(dim=-1, keepdim=True)
         if self.training:
             with torch.no_grad():
-                var = x.pow(2).mean(dim=-1)
-                k = torch.round(torch.log2(torch.sqrt(var + 1e-9)))
-                self.last_k = k.mean().item()
+                # self.last_k = k.mean().item() - Removed for fusion
+                pass
         return BitShiftNormFunction.apply(x, self.gamma)
 
 class DampenedSquareplus(nn.Module):
@@ -238,10 +236,6 @@ class MambaIntegerBlock(nn.Module):
         self.res_gate = nn.Parameter(torch.zeros(1))
 
     def forward(self, hidden_states):
-        if self.training:
-            with torch.no_grad():
-                self.last_act_max = hidden_states.abs().max().item()
-
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
         
