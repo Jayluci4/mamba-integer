@@ -6,11 +6,17 @@ Mamba-Integer is a research-grade implementation of a purely integer-native Stat
 
 *   **Dyadic-Cayley Transform:** Hardware-friendly spectral transforms using the 3-shear lifting scheme.
 *   **Integer-Only Selective Scan:** Linear recurrence implemented via dyadic rational multipliers ($h_t = (h_{t-1} \cdot n) \gg k$), eliminating `exp()` bottlenecks.
-*   **Rational Squareplus Activation:** Division-free polynomial activation ($0.5(x + \sqrt{x^2+4})$) using Newton-RSQRT.
+*   **Rational Squareplus Activation:** Division-free polynomial activation ($0.5(x + \sqrt{x^2+4})$) using Newton-RSQRT. Replaces potentially explosive $x^2$ or transcendental SiLU.
 *   **BitShift Norm:** Power-of-2 normalization with learnable integer scalar. Replaces RMSNorm.
 *   **Rust-Based BPE Tokenizer:** High-performance, dependency-free tokenizer exposed via C-API for maximum portability.
 *   **ZK-Optimal Architecture:** 16x reduction in circuit depth (LogRows 17) and 100% elimination of lookup tables.
 *   **Hardware Independence:** Includes a standalone C++ Inference Engine that runs without PyTorch.
+
+## ⚠️ Known Scientific Findings (The "Stiff Memory" Trap)
+During the initial 15k step training run, we observed a phenomenon where the model's `decay_nums` (memory retention parameters) clustered around `0.9` (Long-Term Memory), effectively destroying the "Fast Decay" heads required for local syntax.
+*   **Cause:** Initial gradients during the stabilization phase pushed all decay parameters towards saturation (32,767).
+*   **Effect:** The model learns global semantic clusters ("Lily", "Forest") but struggles with local grammar coherence.
+*   **Fix for V2:** Freeze `base_decay_nums` for the first 1000 steps (Warmup) or clamp the `decay_mod` range to preserve the HiPPO initialization spectrum.
 
 ## 📂 Repository Structure
 
@@ -27,6 +33,7 @@ Mamba-Integer is a research-grade implementation of a purely integer-native Stat
     *   `prepare_rust_bpe.py`: Script to train the BPE vocabulary.
     *   `sft_mamba_integer.py`: Instruction Tuning loop.
     *   `export_int8.py`: Export trained model to binary format.
+    *   `inference.py`: Python-based inference and analysis.
 *   `configs/`: Model architecture definitions and BPE merge files.
 *   `tests/`: Unit tests and verification scripts.
 *   `archive/`: Older experimental scripts.
