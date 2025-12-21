@@ -30,7 +30,7 @@ archive/
 #  Translations
 *.mo
 *.pot
-*.pt
+scripts/*.pt
 # Django stuff:
 *.log
 local_settings.py
