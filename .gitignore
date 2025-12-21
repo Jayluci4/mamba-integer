@@ -132,6 +132,8 @@ cython_debug/
 input*.json
 settings*.json
 scripts/*.pt
+scripts/*.jsonl
 # Logs
 *.log
 nohup.out
+mamba-integer/scripts/metrics.jsonl
