@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "mamba_integer_step_500.pt"
+MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/scripts/mamba_integer_step_3000.pt"
 
 if not os.path.exists(MODEL_PATH):
     print(f"Error: Could not find {MODEL_PATH}")
