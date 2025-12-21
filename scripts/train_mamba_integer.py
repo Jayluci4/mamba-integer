@@ -15,13 +15,13 @@ sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 # --- Config ---
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config_mamba_integer_l4.json")
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
 # --- Rust Tokenizer ---
 from rust_tokenizer import get_rust_tokenizer
-MERGES_PATH = os.path.join(os.path.dirname(__file__), "rust_bpe_merges.txt")
+MERGES_PATH = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
 rust_tokenizer = get_rust_tokenizer()
 if os.path.exists(MERGES_PATH):
     print(f"Loading merges from {MERGES_PATH}")

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "/home/jayantlohia16/experiment/gemma-intelligent/conv/src/dyadic_experiment/mamba/mamba_integer_step_5500.pt"
+MODEL_PATH = "mamba_integer_step_500.pt"
 
 if not os.path.exists(MODEL_PATH):
     print(f"Error: Could not find {MODEL_PATH}")
@@ -19,13 +19,14 @@ if not os.path.exists(MODEL_PATH):
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
-class SimpleTokenizer:
-    def __init__(self, vocab_size=4096):
-        self.vocab_size = vocab_size
-    def encode(self, text):
-        return [min(b, self.vocab_size - 1) for b in text.encode('utf-8')]
-    def decode(self, ids):
-        return bytes([i for i in ids if i < 256]).decode('utf-8', errors='ignore')
+# --- Rust Tokenizer ---
+from rust_tokenizer import get_rust_tokenizer
+MERGES_PATH = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
+rust_tokenizer = get_rust_tokenizer()
+if os.path.exists(MERGES_PATH):
+    rust_tokenizer.load(MERGES_PATH)
+else:
+    print("WARNING: merges file not found.")
 
 def analyze_model_state(model):
     print("\n--- Model State Analysis ---")
@@ -76,7 +77,6 @@ def run_inference():
     # Analyze before running
     analyze_model_state(model)
     
-    tokenizer = SimpleTokenizer(config['vocab_size'])
     model.eval()
     
     # 2. Prompts
@@ -89,7 +89,7 @@ def run_inference():
     
     for prompt in prompts:
         print(f"\nPrompt: '{prompt}'")
-        input_ids = torch.tensor([tokenizer.encode(prompt)]).to(device)
+        input_ids = torch.tensor([rust_tokenizer.encode(prompt)]).to(device)
         
         generated = input_ids
         model.gradient_checkpointing = False
@@ -109,7 +109,7 @@ def run_inference():
                 
                 generated = torch.cat([generated, next_token], dim=-1)
                 
-        output_text = tokenizer.decode(generated[0].tolist())
+        output_text = rust_tokenizer.decode(generated[0].tolist())
         print(f"Output: {output_text}")
 
 if __name__ == "__main__":
