@@ -270,6 +270,9 @@ class MambaIntegerBlock(nn.Module):
         decay_shifts_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand(B_size, L_size, flat_dim)
         
         h_flat = DyadicScanFunction.apply(u_flat, decay_nums_flat, decay_shifts_flat, 15)
+        if self.training:
+            with torch.no_grad():
+                self.last_act_max = h_flat.abs().max().detach()
         # Clamping
         h_flat = torch.clamp(h_flat, -32000, 32000)
             
