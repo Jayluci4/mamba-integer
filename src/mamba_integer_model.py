@@ -182,10 +182,12 @@ class BitShiftNorm(nn.Module):
     def forward(self, x):
         # Mean Centering for Stability (LayerNorm-like)
         x = x - x.mean(dim=-1, keepdim=True)
+        # Store k statistic as detached tensor (safe for torch.compile)
         if self.training:
             with torch.no_grad():
-                # self.last_k = k.mean().item() - Removed for fusion
-                pass
+                var = x.pow(2).mean(dim=-1)
+                k = torch.log2(torch.sqrt(var + 1e-9)).mean()
+                self.last_k = k.detach()
         return BitShiftNormFunction.apply(x, self.gamma)
 
 class DampenedSquareplus(nn.Module):
