@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from mamba_integer_model import MambaIntegerModel
@@ -7,23 +6,15 @@ import os
 import sys
 import numpy as np
 
-# Add path for rational_bitnet
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../bitnet-odp/src'))
+# Add path for src
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
-CONFIG_PATH = "config_mamba_integer_l4.json"
-# Locate the 14000 step checkpoint (from the exploded run)
-MODEL_PATH = "mamba_integer_step_14000.pt"
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
+MODEL_PATH = "/home/jayantlohia16/experiment/gemma-intelligent/conv/src/dyadic_experiment/mamba/mamba_integer_step_1000.pt"
 
 if not os.path.exists(MODEL_PATH):
-    # Try looking in the experiment root if path was absolute
-    alt_path = "/home/jayantlohia16/experiment/mamba_integer_step_1500.pt"
-    if os.path.exists(alt_path):
-        MODEL_PATH = alt_path
-    else:
-        print(f"Error: Could not find {MODEL_PATH}")
-        # Just create dummy for logic verification if file missing in this env
-        # return
+    print(f"Error: Could not find {MODEL_PATH}")
 
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
@@ -55,6 +46,10 @@ def analyze_model_state(model):
     gamma = layer0.norm.gamma
     print(f"  Norm Gamma: Mean={gamma.mean():.4f}, Max={gamma.max():.4f}")
     
+    # ReZero
+    gate = layer0.res_gate
+    print(f"  ReZero Gate: {gate.item():.4f}")
+    
     # 2. Check for NaNs
     has_nan = False
     for name, param in model.named_parameters():
@@ -72,15 +67,8 @@ def run_inference():
     # 1. Load Model
     model = MambaIntegerModel(config).to(device)
     try:
-        # Load with strict=False to handle missing res_gate
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device), strict=False)
-        print("Model loaded successfully (strict=False).")
-        
-        # Patch res_gate to 1.0 to simulate the old architecture (y = x + F(x))
-        for layer in model.layers:
-            if hasattr(layer, 'res_gate'):
-                layer.res_gate.data.fill_(1.0)
-                
+        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        print("Model loaded successfully.")
     except Exception as e:
         print(f"Failed to load model: {e}")
         return
@@ -95,7 +83,6 @@ def run_inference():
     prompts = [
         "Once upon a time",
         "The quick brown fox",
-        "A", 
     ]
     
     print("\n--- Generation ---")
