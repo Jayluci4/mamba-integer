@@ -131,7 +131,7 @@ cython_debug/
 *.key
 input*.json
 settings*.json
-
+scripts/*.pt
 # Logs
 *.log
 nohup.out
