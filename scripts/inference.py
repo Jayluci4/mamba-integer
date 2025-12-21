@@ -108,6 +108,8 @@ def run_inference():
                 next_token = torch.multinomial(probs, num_samples=1)
                 
                 generated = torch.cat([generated, next_token], dim=-1)
+                if i % 20 == 0: print(f".", end="", flush=True)
+        print() # Newline
                 
         output_text = rust_tokenizer.decode(generated[0].tolist())
         print(f"Output: {output_text}")
