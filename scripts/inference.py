@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from mamba_integer_model import MambaIntegerModel
+from src.mamba_integer_model import MambaIntegerModel
 import json
 import os
 import sys
@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/scripts/mamba_integer_step_3000.pt"
+MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/scripts/mamba_integer_step_4000.pt"
 
 if not os.path.exists(MODEL_PATH):
     print(f"Error: Could not find {MODEL_PATH}")
@@ -20,7 +20,7 @@ with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
 # --- Rust Tokenizer ---
-from rust_tokenizer import get_rust_tokenizer
+from src.rust_tokenizer import get_rust_tokenizer
 MERGES_PATH = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
 rust_tokenizer = get_rust_tokenizer()
 if os.path.exists(MERGES_PATH):
