@@ -77,10 +77,10 @@ def train():
         else:
             other_params.append(param)
             
-    # Reduced LR to prevent explosion at step 500
+    # Ultra-stable settings for BitNet-Mamba
     optimizer = optim.AdamW([
-        {'params': decay_params, 'lr': 1e-2, 'weight_decay': 0.0},
-        {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.01}
+        {'params': decay_params, 'lr': 1e-3, 'weight_decay': 0.0},
+        {'params': other_params, 'lr': 1e-4, 'weight_decay': 0.01}
     ])
     
     total_opt_steps = 15000
@@ -89,9 +89,9 @@ def train():
     # Linear Warmup + Cosine
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=[1e-2, 5e-4], 
+        max_lr=[1e-3, 1e-4], 
         total_steps=total_opt_steps, 
-        pct_start=0.1, # Longer warmup (1500 steps)
+        pct_start=0.1,
         anneal_strategy='cos',
         div_factor=10.0,
         final_div_factor=100.0
@@ -130,7 +130,7 @@ def train():
             step_loss += loss.item()
             
         # Optimizer Step
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad()
