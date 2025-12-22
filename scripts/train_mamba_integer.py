@@ -3,12 +3,16 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+import os
+import sys
+# Add src directory to path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../src"))
+
 from mamba_integer_model import MambaIntegerModel
 import json
 import time
-import os
-import sys
 import numpy as np
+import torch
 
 # Add path for src
 sys.path.insert(0, os.path.dirname(__file__))
@@ -65,8 +69,8 @@ def train():
         
     dataset = BinaryDataset(bin_path, seq_len=512)
     # num_workers=0 avoids torch.compile deadlocks and is fast enough for mmap
-    # BS=4 is safer for L4 VRAM (24GB)
-    dataloader = DataLoader(dataset, batch_size=4, shuffle=False, num_workers=0, pin_memory=True)
+    # BS=2 is safe for L4 VRAM (24GB) when using torch.compile
+    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
     
     # 3. Optimizer: Stiff Memory Protocol
     decay_params = []
@@ -84,7 +88,7 @@ def train():
     ])
     
     total_opt_steps = 15000
-    gradient_accumulation_steps = 16 # Total Batch 64
+    gradient_accumulation_steps = 32 # Total Batch 64
     
     # Linear Warmup + Cosine
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
