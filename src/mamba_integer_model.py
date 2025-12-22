@@ -178,16 +178,15 @@ class BitShiftNorm(nn.Module):
     def __init__(self, dim):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(dim))
-        self.last_k = 0.0 
+        self.register_buffer('last_k', torch.tensor(0.0))
     def forward(self, x):
         # Mean Centering for Stability (LayerNorm-like)
         x = x - x.mean(dim=-1, keepdim=True)
-        # Store k statistic as detached tensor (safe for torch.compile)
         if self.training:
             with torch.no_grad():
                 var = x.pow(2).mean(dim=-1)
                 k = torch.log2(torch.sqrt(var + 1e-9)).mean()
-                self.last_k = k.detach()
+                self.last_k.copy_(k)
         return BitShiftNormFunction.apply(x, self.gamma)
 
 class DampenedSquareplus(nn.Module):
@@ -216,7 +215,7 @@ class MambaIntegerBlock(nn.Module):
         # Rational Squareplus (Restored)
         self.activation = DampenedSquareplus()
         self.gate_activation = RationalSigmoid()
-        self.last_act_max = 0.0
+        self.register_buffer('last_act_max', torch.tensor(0.0))
         
         self.x_proj = BitLinear(d_inner, dt_rank + 2 * d_state)
         self.dt_proj = BitLinear(dt_rank, d_inner)
@@ -259,10 +258,14 @@ class MambaIntegerBlock(nn.Module):
         decay_nums = self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1)
         decay_nums = torch.clamp(decay_nums, 0, 32767)
         
-        # Dampened dt
-        dt_val = self.activation(decay_mod) * 0.01
+        # Dampened dt - lowered further for stability (0.001)
+        dt_val = self.activation(decay_mod) * 0.001
         
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
+        if self.training:
+            with torch.no_grad():
+                self.last_act_max.copy_(u.abs().max())
+        
         B_size, L_size, D_in = x.shape
         flat_dim = D_in * d_state
         u_flat = u.reshape(B_size, L_size, flat_dim)
@@ -270,9 +273,6 @@ class MambaIntegerBlock(nn.Module):
         decay_shifts_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand(B_size, L_size, flat_dim)
         
         h_flat = DyadicScanFunction.apply(u_flat, decay_nums_flat, decay_shifts_flat, 15)
-        if self.training:
-            with torch.no_grad():
-                self.last_act_max = h_flat.abs().max().detach()
         # Clamping
         h_flat = torch.clamp(h_flat, -32000, 32000)
             
