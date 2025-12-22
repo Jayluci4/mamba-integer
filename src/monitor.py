@@ -34,9 +34,13 @@ class DyadicMonitor:
             max_act = 0.0
             count = 0
             for layer in model.layers:
-                avg_k += layer.norm.last_k
-                if layer.last_act_max > max_act:
-                    max_act = layer.last_act_max
+                # Convert back to float here (outside compiled graph)
+                k_val = layer.norm.last_k.item() if torch.is_tensor(layer.norm.last_k) else layer.norm.last_k
+                act_val = layer.last_act_max.item() if torch.is_tensor(layer.last_act_max) else layer.last_act_max
+                
+                avg_k += k_val
+                if act_val > max_act:
+                    max_act = act_val
                 count += 1
             metrics['norm/avg_shift_k'] = avg_k / count
             metrics['stability/max_activation'] = max_act
@@ -71,7 +75,7 @@ class DyadicMonitor:
         
     def print_alert(self, m):
         # "Geiger Counter" Logic
-        print(f"  [Monitor] Decay: {m['dyadic/mean_decay']:.4f} | Shift K: {m['norm/avg_shift_k']:.2f} | MaxAct: {m['stability/max_activation']:.1f} | Zeros: {m['bitnet/zero_sparsity']:.1%}")
+        print(f"  [Monitor] Decay: {m['dyadic/mean_decay']:.4f} | Shift K: {m['norm/avg_shift_k']:.2f} | MaxAct: {m['stability/max_activation']:.2e} | Zeros: {m['bitnet/zero_sparsity']:.1%}")
         
         if m['norm/avg_shift_k'] > 10:
             print("  🚨 CRITICAL: Shift K > 10. Explosion Imminent!")
