@@ -16,20 +16,28 @@ from rational_bitnet import BitLinear
 # --- Load Kernels ---
 def load_lib(name):
     path = os.path.join(os.path.dirname(__file__), f"cuda_kernels/lib{name}.so")
-    if os.path.exists(path):
-        return ctypes.CDLL(path)
-    return None
+    # Disable ctypes for torch.compile compatibility
+    return None 
+    # if os.path.exists(path):
+    #    return ctypes.CDLL(path)
+    # return None
 
 lib_bitshift = load_lib("bitshift_norm")
 lib_squareplus = load_lib("squareplus")
 import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "triton_kernels"))
-from dyadic_scan import dyadic_scan_triton
+from dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
 
 # Setup library path for custom CUDA kernels
 LIB_PATH = os.path.join(os.path.dirname(__file__), "cuda_kernels/libdyadic_mamba.so")
-lib_scan = ctypes.CDLL(LIB_PATH) if os.path.exists(LIB_PATH) else None
+lib_scan = None
+# if os.path.exists(LIB_PATH):
+#    print(f"DEBUG: Found CUDA Library at {LIB_PATH}")
+#    lib_scan = ctypes.CDLL(LIB_PATH)
+# else:
+#    print(f"DEBUG: CUDA Library NOT FOUND at {LIB_PATH}")
+#    lib_scan = None
 
 # --- Autograd Functions ---
 
@@ -124,23 +132,13 @@ class DyadicScanFunction(torch.autograd.Function):
     def forward(ctx, u, decay_nums_float, decay_shifts, scale_bits=15):
         ctx.scale_bits = scale_bits
         B, L, D = u.shape
-        h = torch.empty_like(u)
         
         u_c = u.contiguous()
         d_n_c = decay_nums_float.contiguous().int()
         d_s_c = decay_shifts.contiguous().int()
         
-        if u.is_cuda:
-            h = dyadic_scan_triton(u_c, d_n_c, d_s_c, scale_bits)
-        else:
-            scale = 2.0**scale_bits
-            h_curr = torch.zeros(B, D, device=u.device)
-            h_list = []
-            for t in range(L):
-                decay = decay_nums_float[:, t, :] / (2.0 ** decay_shifts[:, t, :].float())
-                h_curr = h_curr * decay + u[:, t, :]
-                h_list.append(h_curr)
-            h = torch.stack(h_list, dim=1)
+        # Always use Triton for speed + compilation support
+        h = dyadic_scan_triton(u_c, d_n_c, d_s_c, scale_bits)
             
         ctx.save_for_backward(h, decay_nums_float, decay_shifts)
         return h
@@ -148,28 +146,17 @@ class DyadicScanFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_h):
         h, decay_nums_float, decay_shifts = ctx.saved_tensors
-        B, L, D = grad_h.shape
-        grad_u = torch.empty_like(grad_h)
-        grad_decay = torch.empty_like(grad_h)
         
-        gh_c = grad_h.contiguous()
+        # Ensure contiguous inputs
+        grad_h_c = grad_h.contiguous()
         h_c = h.contiguous()
-        dn_c = decay_nums_float.contiguous().int()
-        ds_c = decay_shifts.contiguous().int()
+        d_n_c = decay_nums_float.contiguous().int()
+        d_s_c = decay_shifts.contiguous().int()
         
-        if lib_scan and grad_h.is_cuda:
-            lib_scan.launch_dyadic_scan_backward(
-                ctypes.c_void_p(gh_c.data_ptr()),
-                ctypes.c_void_p(h_c.data_ptr()),
-                ctypes.c_void_p(dn_c.data_ptr()),
-                ctypes.c_void_p(ds_c.data_ptr()),
-                ctypes.c_void_p(grad_u.data_ptr()),
-                ctypes.c_void_p(grad_decay.data_ptr()),
-                ctypes.c_int(B), ctypes.c_int(L), ctypes.c_int(D),
-                ctypes.c_int(ctx.scale_bits)
-            )
-        else:
-            grad_u = grad_h.clone() 
+        # Use Triton backward for full inductor fusion
+        grad_u, grad_decay = dyadic_scan_backward_triton(
+            grad_h_c, h_c, d_n_c, d_s_c, ctx.scale_bits
+        )
         return grad_u, grad_decay, None, None
 
 # --- Modules ---
@@ -182,11 +169,11 @@ class BitShiftNorm(nn.Module):
     def forward(self, x):
         # Mean Centering for Stability (LayerNorm-like)
         x = x - x.mean(dim=-1, keepdim=True)
-        if self.training:
-            with torch.no_grad():
-                var = x.pow(2).mean(dim=-1)
-                k = torch.log2(torch.sqrt(var + 1e-9)).mean()
-                self.last_k.copy_(k)
+        # if self.training:
+        #    with torch.no_grad():
+        #        var = x.pow(2).mean(dim=-1)
+        #        k = torch.log2(torch.sqrt(var + 1e-9)).mean()
+        #        self.last_k.copy_(k)
         return BitShiftNormFunction.apply(x, self.gamma)
 
 class DampenedSquareplus(nn.Module):
@@ -258,13 +245,14 @@ class MambaIntegerBlock(nn.Module):
         decay_nums = self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1)
         decay_nums = torch.clamp(decay_nums, 0, 32767)
         
-        # Dampened dt - lowered further for stability (0.001)
-        dt_val = self.activation(decay_mod) * 0.001
+        # Dampened dt - Aggressive 0.1 for Rescue Plan
+        dt_val = self.activation(decay_mod) * 0.1
         
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
-        if self.training:
-            with torch.no_grad():
-                self.last_act_max.copy_(u.abs().max())
+        # Monitoring disabled for speed (avoid graph breaks)
+        # if self.training:
+        #    with torch.no_grad():
+        #        self.last_act_max.copy_(u.abs().max())
         
         B_size, L_size, D_in = x.shape
         flat_dim = D_in * d_state
