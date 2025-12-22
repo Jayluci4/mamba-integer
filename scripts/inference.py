@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/scripts/mamba_integer_step_4000.pt"
+MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/mamba_integer_step_1500.pt"
 
 if not os.path.exists(MODEL_PATH):
     print(f"Error: Could not find {MODEL_PATH}")
@@ -68,7 +68,15 @@ def run_inference():
     # 1. Load Model
     model = MambaIntegerModel(config).to(device)
     try:
-        model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
+        state_dict = torch.load(MODEL_PATH, map_location=device)
+        # Fix for torch.compile prefix
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k.startswith("_orig_mod."):
+                new_state_dict[k[10:]] = v
+            else:
+                new_state_dict[k] = v
+        model.load_state_dict(new_state_dict)
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Failed to load model: {e}")
