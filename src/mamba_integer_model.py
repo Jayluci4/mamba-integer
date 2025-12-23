@@ -28,6 +28,11 @@ import sys
 import os
 sys.path.append(os.path.join(os.path.dirname(__file__), "triton_kernels"))
 from dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
+try:
+    from bitnet_kernels import fast_bitshift_norm
+    BITSHIFT_TRITON_AVAILABLE = True
+except ImportError:
+    BITSHIFT_TRITON_AVAILABLE = False
 
 # Setup library path for custom CUDA kernels
 LIB_PATH = os.path.join(os.path.dirname(__file__), "cuda_kernels/libdyadic_mamba.so")
@@ -50,7 +55,10 @@ class BitShiftNormFunction(torch.autograd.Function):
         B, S, D = x.shape
         out = torch.empty_like(x)
         
-        if lib_bitshift and x.is_cuda:
+        if BITSHIFT_TRITON_AVAILABLE and x.is_cuda:
+            # Use Fused Triton Kernel (Fast)
+            return fast_bitshift_norm(x, gamma)
+        elif lib_bitshift and x.is_cuda:
             lib_bitshift.launch_bitshift_norm(
                 ctypes.c_void_p(x.contiguous().data_ptr()),
                 ctypes.c_void_p(gamma.contiguous().data_ptr()),
