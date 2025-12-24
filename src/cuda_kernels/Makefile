@@ -1,6 +1,6 @@
 NVCC = nvcc
-# Targeting L4 (89), A100 (80), H100 (90)
-NVCC_FLAGS = -O3 --compiler-options '-fPIC' -shared -gencode arch=compute_80,code=sm_80 -gencode arch=compute_89,code=sm_89 -gencode arch=compute_90,code=sm_90
+# Targeting A100 (80). NVCC 11.5 supports up to 86/80.
+NVCC_FLAGS = -O3 --compiler-options '-fPIC' -shared -gencode arch=compute_80,code=sm_80
 
 all: libdyadic_mamba.so libbitshift_norm.so libsquareplus.so
 

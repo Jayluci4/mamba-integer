@@ -32,8 +32,10 @@ from triton_kernels.dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_
 try:
     from triton_kernels.bitnet_kernels import fast_bitshift_norm
     BITSHIFT_TRITON_AVAILABLE = True
-except ImportError:
+    print("DEBUG: Triton BitNet Kernels Loaded Successfully.")
+except ImportError as e:
     BITSHIFT_TRITON_AVAILABLE = False
+    print(f"DEBUG: Triton BitNet Kernels Failed to Load: {e}")
 
 # Setup library path for custom CUDA kernels
 LIB_PATH = os.path.join(os.path.dirname(__file__), "cuda_kernels/libdyadic_mamba.so")
