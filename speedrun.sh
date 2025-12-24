@@ -1,31 +1,27 @@
 #!/bin/bash
 
-# --- Mamba-Integer V2 Portable Speedrun Script ---
-# Designed to run on any Ubuntu/Debian VM with a GPU.
+# --- Mamba-Integer V2 Speedrun Script ---
+# Optimized for A100/H100 GPUs with Triton parallel scan kernels
 
-set -e 
+set -e
 
 # 1. Determine base directory
 REPO_ROOT=$(pwd)
+echo "=== Mamba-Integer Training ==="
 echo "Running from: $REPO_ROOT"
 
 echo "--- Phase 0: Dependency Check ---"
-# Check for NVCC (CUDA Compiler)
+# Check for NVCC (CUDA Compiler) - optional now since we use Triton
 if ! command -v nvcc &> /dev/null; then
-    echo "Error: nvcc not found. CUDA Toolkit is required."
-    echo "Attempting to find it in common locations..."
+    echo "Warning: nvcc not found. Checking common locations..."
     export PATH=$PATH:/usr/local/cuda/bin
-    if ! command -v nvcc &> /dev/null; then
-        echo "Still not found. Please install CUDA Toolkit."
-        exit 1
+    if command -v nvcc &> /dev/null; then
+        nvcc --version
+    else
+        echo "NVCC not found - CUDA kernels disabled, using Triton only (recommended)"
     fi
-fi
-nvcc --version
-
-# Check for build tools
-if ! command -v make &> /dev/null; then
-    echo "Error: make not found. Please install build-essential."
-    exit 1
+else
+    nvcc --version
 fi
 
 echo "--- Phase 1: Environment Setup ---"
@@ -42,41 +38,40 @@ uv pip install torch torchvision torchaudio --index-url https://download.pytorch
 uv pip install triton numpy sympy
 
 echo "--- Phase 2: Path Configuration ---"
-# Attempt to find bitnet-odp relative to this folder
-# We check if it's a neighbor or inside. 
-if [ -d "../bitnet-odp" ]; then
-    BITNET_PATH="$(cd ../bitnet-odp/src && pwd)"
-elif [ -d "./bitnet-odp" ]; then
-    BITNET_PATH="$(cd ./bitnet-odp/src && pwd)"
-else
-    echo "Warning: bitnet-odp not found. Standard BitLinear may fail."
-    BITNET_PATH=""
-fi
-
-# Ensure src is in PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:$REPO_ROOT/src:$BITNET_PATH"
+# src/rational_bitnet.py is self-contained, no external dependency needed
+export PYTHONPATH="$PYTHONPATH:$REPO_ROOT/src"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
 echo "--- Phase 3: Kernel Preparation ---"
-# Build CUDA kernels
-echo "Building CUDA kernels..."
-if [ -d "$REPO_ROOT/src/cuda_kernels" ]; then
+# CUDA kernels are optional - Triton kernels are preferred and faster
+if [ -d "$REPO_ROOT/src/cuda_kernels" ] && command -v nvcc &> /dev/null; then
+    echo "Building optional CUDA kernels..."
     cd "$REPO_ROOT/src/cuda_kernels"
-    make clean
-    make
+    make clean 2>/dev/null || true
+    make 2>/dev/null || echo "CUDA kernel build failed - using Triton kernels instead"
     cd "$REPO_ROOT"
 else
-    echo "Error: src/cuda_kernels directory not found."
-    exit 1
+    echo "Using Triton kernels (parallel scan enabled)"
 fi
 
 echo "--- Phase 4: Data Check ---"
 if [ ! -f "scripts/tinystories_train.bin" ]; then
     echo "Dataset not found at scripts/tinystories_train.bin"
     echo "Please ensure data is prepared before running."
-    # exit 1 # Optional: auto-download logic could go here
 fi
 
-echo "--- Phase 5: Launch Training ---"
-# Using -u for unbuffered logs (critical for nohup)
-PYTHONUNBUFFERED=1 python3 -u scripts/train_mamba_integer.py
+echo "--- Phase 5: Performance Settings ---"
+# Optimal settings for A100/H100
+export CUDA_LAUNCH_BLOCKING=0
+export TORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export TRITON_CACHE_DIR="$REPO_ROOT/.triton_cache"
+
+echo "--- Phase 6: Launch Training ---"
+echo "Starting training with optimizations:"
+echo "  - Parallel prefix scan (Triton)"
+echo "  - BitLinear quantization caching"
+echo "  - torch.compile enabled"
+echo ""
+
+# Using -u for unbuffered logs
+PYTHONUNBUFFERED=1 python3 -u scripts/train_mamba_integer.py 2>&1 | tee training_speedrun.log
