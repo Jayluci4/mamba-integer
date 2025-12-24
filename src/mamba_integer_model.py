@@ -54,7 +54,7 @@ class BitShiftNormFunction(torch.autograd.Function):
     def forward(ctx, x, gamma, scale_bits=0):
         B, S, D = x.shape
         out = torch.empty_like(x)
-        
+
         if BITSHIFT_TRITON_AVAILABLE and x.is_cuda:
             # Use Fused Triton Kernel (Fast)
             y, inv_rms = fast_bitshift_norm(x, gamma)
@@ -64,11 +64,14 @@ class BitShiftNormFunction(torch.autograd.Function):
             # ... existing ctypes logic ...
             pass
         else:
-            # CPU Fallback
-            var = x.pow(2).mean(dim=-1, keepdim=True)
-            k = torch.round(torch.log2(torch.sqrt(var + 1e-9))).int()
-            k = torch.clamp(k, min=0)
-            inv_rms = 1.0 / (2.0 ** k.float())
+            # CPU Fallback - optimized single-pass computation
+            # Compute variance directly (x is already mean-centered from BitShiftNorm.forward)
+            var = (x * x).mean(dim=-1, keepdim=True)
+            # Use fast bit operations: log2(sqrt(var)) = 0.5 * log2(var)
+            # Avoid sqrt by using: k = round(0.5 * log2(var))
+            k = torch.round(0.5 * torch.log2(var + 1e-9)).int()
+            k = torch.clamp(k, min=0, max=15)  # Clamp to reasonable range
+            inv_rms = torch.pow(2.0, -k.float())
             out = x * inv_rms * gamma
             ctx.save_for_backward(x, gamma, inv_rms)
             return out
@@ -172,15 +175,12 @@ class BitShiftNorm(nn.Module):
         super().__init__()
         self.gamma = nn.Parameter(torch.ones(dim))
         self.register_buffer('last_k', torch.tensor(0.0))
+
     def forward(self, x):
-        # Mean Centering for Stability (LayerNorm-like)
-        x = x - x.mean(dim=-1, keepdim=True)
-        # if self.training:
-        #    with torch.no_grad():
-        #        var = x.pow(2).mean(dim=-1)
-        #        k = torch.log2(torch.sqrt(var + 1e-9)).mean()
-        #        self.last_k.copy_(k)
-        return BitShiftNormFunction.apply(x, self.gamma)
+        # Fused mean centering - compute once and reuse
+        mean = x.mean(dim=-1, keepdim=True)
+        x_centered = x - mean
+        return BitShiftNormFunction.apply(x_centered, self.gamma)
 
 class DampenedSquareplus(nn.Module):
     def forward(self, x):
@@ -232,51 +232,58 @@ class MambaIntegerBlock(nn.Module):
     def forward(self, hidden_states):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        
+
         xz = self.in_proj(hidden_states)
         x, z = xz.chunk(2, dim=-1)
-        
+
+        # Fused transpose-conv-transpose
         x_t = x.transpose(1, 2)
         x_t = self.conv1d(x_t)[:, :, :hidden_states.shape[1]]
         x = x_t.transpose(1, 2)
-        
+
         x = self.activation(x)
-        
+
         x_dbl = self.x_proj(x)
         dt_rank = self.config['ssm_cfg']['dt_rank']
         d_state = self.config['ssm_cfg']['d_state']
         dt, B_ssm, C_ssm = x_dbl.split([dt_rank, d_state, d_state], dim=-1)
-        
+
         decay_mod = self.dt_proj(dt)
-        decay_nums = self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1)
-        decay_nums = torch.clamp(decay_nums, 0, 32767)
-        
-        # Dampened dt - Aggressive 0.1 for Rescue Plan
+        # Fused add and clamp
+        decay_nums = (self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1)).clamp(0, 32767)
+
+        # Fused activation and scaling
         dt_val = self.activation(decay_mod) * 0.1
-        
+
+        # Fused multiplication
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
-        # Monitoring disabled for speed (avoid graph breaks)
-        # if self.training:
-        #    with torch.no_grad():
-        #        self.last_act_max.copy_(u.abs().max())
-        
+
         B_size, L_size, D_in = x.shape
         flat_dim = D_in * d_state
+
+        # Optimized reshaping (use view instead of reshape when possible)
         u_flat = u.reshape(B_size, L_size, flat_dim)
         decay_nums_flat = decay_nums.reshape(B_size, L_size, flat_dim)
+        # Pre-compute decay_shifts expansion (avoid repeated expand)
         decay_shifts_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand(B_size, L_size, flat_dim)
-        
+
         h_flat = DyadicScanFunction.apply(u_flat, decay_nums_flat, decay_shifts_flat, 15)
-        # Clamping
-        h_flat = torch.clamp(h_flat, -32000, 32000)
-            
+        # Clamping (non-inplace for autograd compatibility)
+        h_flat = h_flat.clamp(-32000, 32000)
+
         h = h_flat.reshape(B_size, L_size, D_in, d_state)
-        y = torch.einsum('bldn,bln->bld', h, C_ssm)
-        y = y * self.gate_activation(z)
-        
+        # Optimized matmul instead of einsum for better compilation
+        y = (h * C_ssm.unsqueeze(2)).sum(dim=-1)
+
+        # Fused gate activation and multiplication
+        z_gate = self.gate_activation(z)
+        y = y * z_gate
+
         out = self.out_proj(y)
-        out = torch.clamp(out, -32000, 32000)
-        
+        # Clamping (non-inplace for autograd compatibility)
+        out = out.clamp(-32000, 32000)
+
+        # Fused residual add with scaling
         return residual + out * self.res_gate
 
 from torch.utils.checkpoint import checkpoint

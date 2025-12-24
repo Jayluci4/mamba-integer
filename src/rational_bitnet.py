@@ -27,7 +27,7 @@ from typing import Optional, Tuple, Dict, Any, Union
 from dataclasses import dataclass
 import math
 
-# Try to import Triton kernels for fused operations (25x speedup)
+# Try to import Triton kernels for fused operations
 try:
     from triton_rational import (
         FusedRationalSiLU,
@@ -38,6 +38,13 @@ try:
     TRITON_AVAILABLE = has_triton()
 except ImportError:
     TRITON_AVAILABLE = False
+
+# Try to import fused BitNet kernels
+try:
+    from triton_kernels.bitnet_kernels import fast_quantize_activations
+    BITNET_TRITON_AVAILABLE = True
+except ImportError:
+    BITNET_TRITON_AVAILABLE = False
 
 
 # =============================================================================
@@ -88,14 +95,18 @@ def activation_quant_dynamic(x: torch.Tensor, bits: int = 8) -> Tuple[torch.Tens
 
     This preserves the relative magnitudes within each token.
     """
+    # Use fused Triton kernel if available (faster)
+    if BITNET_TRITON_AVAILABLE and x.is_cuda and bits == 8:
+        return fast_quantize_activations(x)
+
     Q_max = (1 << (bits - 1)) - 1  # 127 for 8-bit
 
-    # Per-token scaling (last dim is hidden)
-    scale = x.abs().max(dim=-1, keepdim=True).values.clamp(min=1e-8)
+    # Fused abs-max computation (more efficient than .abs().max())
+    scale = torch.amax(torch.abs(x), dim=-1, keepdim=True).clamp(min=1e-8)
 
-    # Quantize
-    x_scaled = x * Q_max / scale
-    x_quant = ste_round(x_scaled).clamp(-Q_max, Q_max)
+    # Fused quantization (combine ops for better fusion)
+    inv_scale = Q_max / scale
+    x_quant = ste_round(x * inv_scale).clamp(-Q_max, Q_max)
 
     return x_quant, scale / Q_max
 
@@ -148,22 +159,44 @@ class BitLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
 
+        # Quantization cache - uses weight._version to detect optimizer updates
+        self._cached_w_quant = None
+        self._cached_w_scale = None
+        self._cached_weight_version = -1  # Track weight tensor version
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with ternary weights and quantized activations.
 
         During training:
         - Use STE to allow gradients to flow through quantization
         - Full precision accumulation for stability
+        - Cache weight quantization (recompute only after optimizer.step())
 
         During inference:
         - Weights are truly {-1, 0, 1}
         - Activations are 8-bit integers
         - Matmul becomes additions only
         """
-        # Quantize weights to {-1, 0, 1}
-        w_quant, w_scale = weight_quant_ternary(self.weight)
+        # Check if weights were updated by optimizer (version changes on in-place ops)
+        current_version = self.weight._version
 
-        # Quantize activations
+        # Quantize weights to {-1, 0, 1} - USE CACHE
+        # Only recompute if: no cache, or weight version changed (optimizer stepped)
+        if (self._cached_w_quant is None or
+            self._cached_weight_version != current_version or
+            not self.training):
+            w_quant, w_scale = weight_quant_ternary(self.weight)
+            if self.training:
+                # Detach cached values to avoid graph issues on subsequent backwards
+                self._cached_w_quant = w_quant.detach()
+                self._cached_w_scale = w_scale.detach()
+                self._cached_weight_version = current_version
+        else:
+            # Re-apply STE for gradient flow through cached quantized weights
+            w_quant = self.weight + (self._cached_w_quant - self.weight).detach()
+            w_scale = self._cached_w_scale
+
+        # Quantize activations (cannot cache - depends on input)
         x_quant, x_scale = activation_quant_dynamic(x, self.activation_bits)
 
         # Matrix multiplication (in full precision for training)

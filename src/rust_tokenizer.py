@@ -87,10 +87,21 @@ def get_rust_tokenizer(merges_path=None):
     # Adjust path to find lib relative to this file or current dir
     # Try current dir first, then ../cuda_kernels/
     base = os.path.dirname(os.path.abspath(__file__))
-    lib_path = os.path.join(base, "../cuda_kernels/librustbpe.so")
+    lib_path = os.path.join(base, "cuda_kernels/librustbpe.so")
+    
+    if not os.path.exists(lib_path):
+        # Try alternative path
+        lib_path = os.path.join(base, "../cuda_kernels/librustbpe.so")
+    
+    if not os.path.exists(lib_path):
+        # Try rust_tokenizer target directory
+        lib_path = os.path.join(base, "rust_tokenizer/target/release/librustbpe.so")
     
     if not os.path.exists(lib_path):
         # Fallback to experiment path if running from weird location
         lib_path = "/home/jayantlohia16/experiment/mamba-integer/src/cuda_kernels/librustbpe.so"
+    
+    if not os.path.exists(lib_path):
+        raise FileNotFoundError(f"Could not find librustbpe.so. Tried: {lib_path}")
         
     return RustTokenizer(lib_path, merges_path)

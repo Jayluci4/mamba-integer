@@ -9,30 +9,51 @@ from triton.language.extra.cuda import libdevice
 @triton.jit
 def quantize_activations_kernel(
     x_ptr, x_quant_ptr, scale_ptr,
-    n_elements, BLOCK_SIZE: tl.constexpr,
+    stride_row, n_cols,
+    BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    row_start = pid * BLOCK_SIZE
-    offsets = row_start + tl.arange(0, BLOCK_SIZE)
-    x = tl.load(x_ptr + offsets)
-    
+    """Fused per-row activation quantization: abs-max + scale + round."""
+    pid = tl.program_id(0)  # Row index
+
+    # Compute pointers for this row
+    row_start = pid * stride_row
+    offsets = tl.arange(0, BLOCK_SIZE)
+    mask = offsets < n_cols
+
+    # Load row with mask
+    x = tl.load(x_ptr + row_start + offsets, mask=mask, other=0.0)
+
+    # Compute abs-max for this row
     abs_x = tl.abs(x)
     max_val = tl.max(abs_x, axis=0)
-    scale = max_val if max_val > 1e-8 else 1e-8
+    scale = tl.maximum(max_val, 1e-8)
     tl.store(scale_ptr + pid, scale)
-    
+
+    # Quantize: round(x * 127 / scale), clamp to [-127, 127]
     q_factor = 127.0 / scale
     x_quant = libdevice.rint(x * q_factor)
     x_quant = tl.clamp(x_quant, -127.0, 127.0)
-    tl.store(x_quant_ptr + offsets, x_quant)
+    tl.store(x_quant_ptr + row_start + offsets, x_quant, mask=mask)
+
 
 def fast_quantize_activations(x):
-    x_flat = x.view(-1, x.shape[-1])
-    n_rows, hidden_dim = x_flat.shape
-    x_quant = torch.empty_like(x_flat, dtype=x.dtype)
+    """Fused activation quantization using Triton kernel."""
+    # Ensure contiguous for kernel
+    x_contig = x.contiguous()
+    x_flat = x_contig.view(-1, x_contig.shape[-1])
+    n_rows, n_cols = x_flat.shape
+    x_quant = torch.empty_like(x_flat)
     scale = torch.empty(n_rows, device=x.device, dtype=x.dtype)
-    BLOCK_SIZE = triton.next_power_of_2(hidden_dim)
-    quantize_activations_kernel[(n_rows,)](x_flat, x_quant, scale, n_rows * hidden_dim, BLOCK_SIZE=BLOCK_SIZE)
+
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    # Limit block size to avoid register pressure
+    BLOCK_SIZE = min(BLOCK_SIZE, 4096)
+
+    quantize_activations_kernel[(n_rows,)](
+        x_flat, x_quant, scale,
+        x_flat.stride(0), n_cols,
+        BLOCK_SIZE=BLOCK_SIZE
+    )
     return x_quant.view_as(x), scale.view(*x.shape[:-1], 1) / 127.0
 
 # --- Fused BitNet MatMul Forward ---

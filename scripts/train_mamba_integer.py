@@ -1,5 +1,10 @@
 
 import torch
+# Enable TF32 BEFORE any other torch operations for maximum performance
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
@@ -12,7 +17,6 @@ from mamba_integer_model import MambaIntegerModel
 import json
 import time
 import numpy as np
-import torch
 
 # Add path for src
 sys.path.insert(0, os.path.dirname(__file__))
@@ -41,8 +45,9 @@ class BinaryDataset(Dataset):
         offset = np.random.randint(0, self.n_tokens - self.seq_len - 1)
         chunk = self.data[offset : offset + self.seq_len + 1].astype(np.int64)
         
-        x = torch.from_numpy(chunk[:-1])
-        y = torch.from_numpy(chunk[1:])
+        # Create tensors directly (faster than from_numpy for small arrays)
+        x = torch.tensor(chunk[:-1], dtype=torch.long)
+        y = torch.tensor(chunk[1:], dtype=torch.long)
         
         # Loss masking: Padding is not relevant in packed binary, 
         # but we use 0 as document separator. Let's mask 0 targets.
@@ -53,8 +58,10 @@ class BinaryDataset(Dataset):
 
 def train():
     print("--- High Efficiency Mamba-Integer V2 Training ---")
-    # Enable TF32 for Ampere+ GPUs (A100/H100)
-    torch.set_float32_matmul_precision('high')
+    print(f"TF32 enabled: matmul={torch.backends.cuda.matmul.allow_tf32}, cudnn={torch.backends.cudnn.allow_tf32}")
+    # Enable cuDNN benchmarking for consistent input sizes
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # 1. Model
@@ -137,6 +144,8 @@ def train():
                 traceback.print_exc()
 
     # Compile AFTER loading weights
+    # Use default mode - 'reduce-overhead' causes very slow first-step compilation
+    # First step will be slow (compilation), but subsequent steps will be fast
     model = torch.compile(model)
     
     # 2. Data
@@ -146,9 +155,11 @@ def train():
         return
         
     dataset = BinaryDataset(bin_path, seq_len=512)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
-    
-    gradient_accumulation_steps = 32 # Total Batch 64
+    # Batch size optimized for A100 80GB - reduce if OOM
+    # Effective batch size = batch_size * gradient_accumulation_steps
+    batch_size = 8  # Reduced from 16 to avoid OOM
+    gradient_accumulation_steps = 8  # Effective batch = 64
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
     
     # Monitor
@@ -165,7 +176,7 @@ def train():
     data_iter = iter(dataloader)
     
     for opt_step in range(start_step, total_opt_steps):
-        step_loss = 0
+        step_loss = torch.tensor(0.0, device=device)  # Keep on GPU
         for _ in range(gradient_accumulation_steps):
             try:
                 x, y = next(data_iter)
@@ -179,7 +190,9 @@ def train():
             loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
             loss = loss / gradient_accumulation_steps
             loss.backward()
-            step_loss += loss.item()
+            # CRITICAL: Don't call .item() here - it causes CPU-GPU sync!
+            # Accumulate loss tensor instead, only convert to float after backward
+            step_loss += loss.detach()  # Keep on GPU, detach from graph
             
         # Optimizer Step
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
@@ -189,12 +202,15 @@ def train():
         
         if opt_step % 10 == 0:
             elapsed = time.time() - start_time
-            print(f"Step {opt_step}/{total_opt_steps} | Loss: {step_loss:.4f} | Time: {elapsed:.2f}s")
+            # Convert accumulated loss tensor to float (only once per logging)
+            loss_val = step_loss.item() if isinstance(step_loss, torch.Tensor) else step_loss
+            print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | Time: {elapsed:.2f}s")
             try:
                 # Log stats (using uncompiled model refs via layers)
                 # Note: model.layers access might need model._orig_mod.layers if compiled
                 # Or just try-except
-                monitor.log_step(opt_step, model, step_loss)
+                loss_for_monitor = loss_val if isinstance(step_loss, torch.Tensor) else step_loss
+                monitor.log_step(opt_step, model, loss_for_monitor)
             except: pass
             
         if opt_step > 0 and opt_step % 500 == 0:
@@ -212,8 +228,29 @@ def train():
     torch.save(model.state_dict(), "mamba_integer_final.pt")
 
 if __name__ == "__main__":
-    # Internal Redirection for Safety (Line Buffered)
+    # Log to both file and stdout for visibility
     log_file = open("training_INTERNAL_LOG.log", "w", buffering=1)
-    sys.stdout = log_file
-    sys.stderr = log_file
+    
+    class TeeOutput:
+        def __init__(self, *files):
+            self.files = files
+        def write(self, obj):
+            for f in self.files:
+                f.write(obj)
+                f.flush()
+        def flush(self):
+            for f in self.files:
+                f.flush()
+        def isatty(self):
+            # Check if any of the files is a TTY (usually stdout)
+            return any(hasattr(f, 'isatty') and f.isatty() for f in self.files)
+        def fileno(self):
+            # Return the fileno of the first file (usually stdout)
+            if self.files and hasattr(self.files[0], 'fileno'):
+                return self.files[0].fileno()
+            raise OSError("fileno not available")
+    
+    tee = TeeOutput(sys.stdout, log_file)
+    sys.stdout = tee
+    sys.stderr = tee
     train()
