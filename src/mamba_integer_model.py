@@ -26,10 +26,11 @@ lib_bitshift = load_lib("bitshift_norm")
 lib_squareplus = load_lib("squareplus")
 import sys
 import os
-sys.path.append(os.path.join(os.path.dirname(__file__), "triton_kernels"))
-from dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
+# Ensure src is in path for triton_kernels package
+sys.path.append(os.path.dirname(__file__))
+from triton_kernels.dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
 try:
-    from bitnet_kernels import fast_bitshift_norm
+    from triton_kernels.bitnet_kernels import fast_bitshift_norm
     BITSHIFT_TRITON_AVAILABLE = True
 except ImportError:
     BITSHIFT_TRITON_AVAILABLE = False
@@ -292,7 +293,12 @@ class MambaIntegerModel(nn.Module):
     def forward(self, input_ids):
         x = self.embedding(input_ids)
         for layer in self.layers:
-            x = layer(x)
+            if self.gradient_checkpointing and self.training:
+                # Use torch.utils.checkpoint to save memory
+                # Note: x must require_grad for checkpointing to work
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
         x = self.norm_f(x)
         logits = self.lm_head(x)
         return logits
