@@ -399,6 +399,10 @@ def dyadic_scan_bwd_parallel_kernel_fast(
         scan_a, scan_b = tl.associative_scan((rev_decay, rev_grad_h), axis=0, combine_fn=combine_fn)
         d_h_acc_rev = scan_a * carry_grad + scan_b
 
+        # Clamp backward gradient accumulator to prevent explosion
+        d_h_acc_rev = tl.where(d_h_acc_rev > 100.0, 100.0, d_h_acc_rev)
+        d_h_acc_rev = tl.where(d_h_acc_rev < -100.0, -100.0, d_h_acc_rev)
+
         tl.store(grad_u_ptr + base_offset + (block_start + rev_offs) * stride_l,
                  d_h_acc_rev, mask=rev_mask)
 
@@ -413,6 +417,9 @@ def dyadic_scan_bwd_parallel_kernel_fast(
 
         last_idx = block_size - 1
         carry_grad = tl.sum(tl.where(offs == last_idx, d_h_acc_rev, 0.0))
+        # Clamp carry to prevent cross-block explosion
+        carry_grad = tl.where(carry_grad > 100.0, 100.0, carry_grad)
+        carry_grad = tl.where(carry_grad < -100.0, -100.0, carry_grad)
 
         if block_start > 0:
             carry_h_prev = tl.load(h_ptr + base_offset + (block_start - 1) * stride_l)
