@@ -1,8 +1,16 @@
+"""
+BitNet Triton Kernels for Integer-Only AI.
+
+All operations use ONLY: +, -, *, /, bit-shift, comparisons
+NO transcendentals (sqrt, log2, exp2, sin, cos, etc.)
+
+This enables ZK-ML compatibility and edge deployment.
+"""
 
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+from triton.language.extra.cuda import libdevice  # Keep for rint in quantization
 
 # --- Forward Kernels ---
 
@@ -35,20 +43,62 @@ def quantize_activations_kernel(
     # Store with mask
     tl.store(x_quant_ptr + row_start + offsets, x_quant, mask=mask)
 
+class QuantizeActivationsFunction(torch.autograd.Function):
+    """Autograd wrapper for activation quantization.
+
+    Forward: x -> x_quant (quantized), scale (per-row max)
+    Backward: Straight-Through Estimator (gradient passes through)
+    """
+
+    @staticmethod
+    def forward(ctx, x):
+        x = x.contiguous()
+        x_flat = x.reshape(-1, x.shape[-1])
+        n_rows, n_cols = x_flat.shape
+        x_quant = torch.empty_like(x_flat, dtype=x.dtype)
+        scale = torch.empty(n_rows, device=x.device, dtype=x.dtype)
+        BLOCK_SIZE = triton.next_power_of_2(n_cols)
+
+        quantize_activations_kernel[(n_rows,)](
+            x_flat, x_quant, scale,
+            n_cols,
+            BLOCK_SIZE=BLOCK_SIZE
+        )
+
+        # Save for backward
+        ctx.save_for_backward(scale)
+        ctx.original_shape = x.shape
+
+        return x_quant.view_as(x), scale.view(*x.shape[:-1], 1) / 127.0
+
+    @staticmethod
+    def backward(ctx, grad_x_quant, grad_scale):
+        # Straight-Through Estimator: pass gradients through unchanged
+        # The quantization is like rounding - we use identity gradient
+        scale, = ctx.saved_tensors
+        original_shape = ctx.original_shape
+
+        # Scale gradient by the quantization factor (chain rule)
+        # Forward: x_quant = round(x * 127 / scale)
+        # dL/dx = dL/dx_quant * 127 / scale
+        #
+        # STABILITY FIX: Use larger min to prevent gradient explosion
+        # If scale < 0.01, the multiplier would be > 12700 which can explode
+        scale_safe = scale.view(*original_shape[:-1], 1).clamp(min=0.01)
+        grad_x = grad_x_quant * 127.0 / scale_safe
+
+        # Clamp gradients to prevent explosion
+        grad_x = grad_x.clamp(-100.0, 100.0)
+
+        return grad_x
+
+
 def fast_quantize_activations(x):
-    x = x.contiguous()
-    x_flat = x.reshape(-1, x.shape[-1])
-    n_rows, n_cols = x_flat.shape
-    x_quant = torch.empty_like(x_flat, dtype=x.dtype)
-    scale = torch.empty(n_rows, device=x.device, dtype=x.dtype)
-    BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    
-    quantize_activations_kernel[(n_rows,)](
-        x_flat, x_quant, scale,
-        n_cols,
-        BLOCK_SIZE=BLOCK_SIZE
-    )
-    return x_quant.view_as(x), scale.view(*x.shape[:-1], 1) / 127.0
+    """Quantize activations with autograd support.
+
+    Uses Triton kernel for forward, STE for backward.
+    """
+    return QuantizeActivationsFunction.apply(x)
 
 # --- Fused BitNet MatMul Forward ---
 # Based on research:
@@ -206,7 +256,43 @@ def fast_bitnet_matmul_backward(grad_output, x_quant, w_quant, x_scale, w_scale)
     grad_w = torch.matmul(g_scaled_w.t(), x_quant.float()) * w_scale.view(-1, 1)
     return grad_x, grad_w
 
-# --- Optimized BitShiftNorm ---
+# --- Optimized BitShiftNorm (INTEGER-ONLY) ---
+# Replaces sqrt, log2, exp2 with lookup table approach
+
+@triton.jit
+def find_power_of_2_scale_triton(var):
+    """Find power-of-2 scale using lookup table (INTEGER-ONLY).
+
+    Instead of: sqrt(var) -> log2 -> exp2(-k)
+    We use: var -> lookup -> scale = 2^(-k)
+
+    Uses ONLY: comparisons and precomputed dyadic rationals.
+    NO transcendentals (sqrt, log2, exp2).
+    """
+    # Thresholds are powers of 4 (= 2^(2k))
+    # If var >= 4^k, then sqrt(var) >= 2^k, so scale = 2^(-k)
+
+    # Start with scale = 1 (k=0)
+    scale = 1.0
+
+    # Check thresholds in order
+    scale = tl.where(var >= 4.0, 0.5, scale)        # sqrt >= 2, use 1/2
+    scale = tl.where(var >= 16.0, 0.25, scale)      # sqrt >= 4, use 1/4
+    scale = tl.where(var >= 64.0, 0.125, scale)     # sqrt >= 8, use 1/8
+    scale = tl.where(var >= 256.0, 0.0625, scale)   # sqrt >= 16, use 1/16
+    scale = tl.where(var >= 1024.0, 0.03125, scale) # sqrt >= 32, use 1/32
+    scale = tl.where(var >= 4096.0, 0.015625, scale)
+    scale = tl.where(var >= 16384.0, 0.0078125, scale)
+    scale = tl.where(var >= 65536.0, 0.00390625, scale)
+
+    # For small variance, scale up
+    scale = tl.where(var < 1.0, 1.0, scale)
+    scale = tl.where(var < 0.25, 2.0, scale)
+    scale = tl.where(var < 0.0625, 4.0, scale)
+    scale = tl.where(var < 0.015625, 8.0, scale)
+
+    return scale
+
 
 @triton.jit
 def bitshift_norm_kernel(
@@ -214,22 +300,26 @@ def bitshift_norm_kernel(
     stride_x_row, stride_out_row, n_cols,
     BLOCK_SIZE: tl.constexpr
 ):
+    """BitShift normalization kernel (INTEGER-ONLY).
+
+    Uses lookup table instead of sqrt/log2/exp2.
+    All operations: +, -, *, /, comparisons (no transcendentals).
+    """
     pid = tl.program_id(0)
     row_ptr_x = x_ptr + pid * stride_x_row
     row_ptr_out = out_ptr + pid * stride_out_row
-    
+
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_cols
     x = tl.load(row_ptr_x + offsets, mask=mask, other=0.0)
-    
+
     mean = tl.sum(x, axis=0) / n_cols
     x_centered = x - mean
     var = tl.sum(x_centered * x_centered, axis=0) / n_cols
-    std = tl.sqrt(var + 1e-9)
-    k = libdevice.rint(tl.log2(std))
-    if k < 0.0: k = 0.0
-    scale = tl.exp2(-k)
-    
+
+    # INTEGER-ONLY: Use lookup table instead of sqrt/log2/exp2
+    scale = find_power_of_2_scale_triton(var + 1e-9)
+
     tl.store(inv_rms_ptr + pid, scale)
     gamma = tl.load(gamma_ptr + offsets, mask=mask, other=1.0)
     tl.store(row_ptr_out + offsets, x_centered * scale * gamma, mask=mask)
