@@ -314,9 +314,14 @@ def dyadic_scan_parallel_kernel_fast(
     D: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
-    """FAST parallel scan assuming shift=15 (constant).
+    """FAST parallel scan with CONVEX COMBINATION (minGRU-style).
 
-    Eliminates 23 tl.where operations per element.
+    Computes: h[t] = decay * h[t-1] + (1 - decay) * u[t]
+
+    This ensures scale-invariance: the state is always a weighted average,
+    preventing explosion regardless of sequence length.
+
+    Reference: "Were RNNs All We Needed?" (2024) - minGRU formulation
     """
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
@@ -338,25 +343,24 @@ def dyadic_scan_parallel_kernel_fast(
         # FAST: Use constant scale instead of 23 conditionals
         decay = compute_dyadic_scale_fast(num_vals)
 
-        scan_a, scan_b = tl.associative_scan((decay, u_vals), axis=0, combine_fn=combine_fn)
-        h_vals = scan_a * carry_b + scan_b
+        # CONVEX COMBINATION: input weighted by (1 - decay)
+        # This ensures h[t] = decay * h[t-1] + (1-decay) * u[t]
+        # Scale is bounded since decay + (1-decay) = 1
+        input_weight = 1.0 - decay
+        weighted_u = input_weight * u_vals
 
-        # Clamp hidden state to prevent accumulation/explosion
-        h_vals = tl.where(h_vals > 100.0, 100.0, h_vals)
-        h_vals = tl.where(h_vals < -100.0, -100.0, h_vals)
+        scan_a, scan_b = tl.associative_scan((decay, weighted_u), axis=0, combine_fn=combine_fn)
+        h_vals = scan_a * carry_b + scan_b
 
         tl.store(h_ptr + ptr_offs, h_vals, mask=mask)
 
         last_idx = block_size - 1
         carry_b = tl.sum(tl.where(offs == last_idx, h_vals, 0.0))
-        # Clamp carry to prevent cross-block explosion
-        carry_b = tl.where(carry_b > 100.0, 100.0, carry_b)
-        carry_b = tl.where(carry_b < -100.0, -100.0, carry_b)
 
 
 @triton.jit
 def dyadic_scan_bwd_parallel_kernel_fast(
-    grad_h_ptr, h_ptr, nums_ptr,
+    grad_h_ptr, h_ptr, u_ptr, nums_ptr,
     grad_u_ptr, grad_nums_ptr,
     stride_b, stride_l, stride_d,
     B: tl.constexpr,
@@ -364,7 +368,16 @@ def dyadic_scan_bwd_parallel_kernel_fast(
     D: tl.constexpr,
     BLOCK_L: tl.constexpr,
 ):
-    """FAST backward scan assuming shift=15 (constant)."""
+    """FAST backward scan for CONVEX COMBINATION formulation.
+
+    Forward was: h[t] = decay * h[t-1] + (1 - decay) * u[t]
+
+    Backward:
+      grad_u[t] = (1 - decay) * grad_h_acc[t]
+      grad_nums[t] = grad_h_acc[t] * (h[t-1] - u[t]) * scale
+
+    Reference: "Were RNNs All We Needed?" (2024)
+    """
     pid_b = tl.program_id(0)
     pid_d = tl.program_id(1)
 
@@ -392,34 +405,34 @@ def dyadic_scan_bwd_parallel_kernel_fast(
                              mask=rev_mask, other=0.0)
         rev_num = tl.load(nums_ptr + base_offset + (block_start + rev_offs) * stride_l,
                           mask=rev_mask, other=0)
+        rev_u = tl.load(u_ptr + base_offset + (block_start + rev_offs) * stride_l,
+                        mask=rev_mask, other=0.0)
 
-        # FAST: Use constant scale (removed unused 'decay' computation)
+        # Compute decay and input_weight
         rev_decay = compute_dyadic_scale_fast(rev_num)
+        rev_input_weight = 1.0 - rev_decay
 
         scan_a, scan_b = tl.associative_scan((rev_decay, rev_grad_h), axis=0, combine_fn=combine_fn)
         d_h_acc_rev = scan_a * carry_grad + scan_b
 
-        # Clamp backward gradient accumulator to prevent explosion
-        d_h_acc_rev = tl.where(d_h_acc_rev > 100.0, 100.0, d_h_acc_rev)
-        d_h_acc_rev = tl.where(d_h_acc_rev < -100.0, -100.0, d_h_acc_rev)
-
+        # grad_u = (1 - decay) * grad_h_acc (convex combination backward)
+        grad_u_rev = rev_input_weight * d_h_acc_rev
         tl.store(grad_u_ptr + base_offset + (block_start + rev_offs) * stride_l,
-                 d_h_acc_rev, mask=rev_mask)
+                 grad_u_rev, mask=rev_mask)
 
-        # Compute grad_nums: FAST path uses constant scale
+        # Compute grad_nums: d/d(decay) of [decay * h_prev + (1-decay) * u]
+        # = h_prev - u
         rev_h_prev = tl.load(h_ptr + base_offset + (block_start + rev_offs - 1) * stride_l,
                              mask=(rev_mask & (rev_offs > 0)), other=0.0)
         rev_h_prev = tl.where(rev_offs == 0, carry_h_prev, rev_h_prev)
 
-        g_nums_rev = d_h_acc_rev * rev_h_prev * SCALE_15
+        # grad_nums = grad_h_acc * (h_prev - u) * scale
+        g_nums_rev = d_h_acc_rev * (rev_h_prev - rev_u) * SCALE_15
         tl.store(grad_nums_ptr + base_offset + (block_start + rev_offs) * stride_l,
                  g_nums_rev, mask=rev_mask)
 
         last_idx = block_size - 1
         carry_grad = tl.sum(tl.where(offs == last_idx, d_h_acc_rev, 0.0))
-        # Clamp carry to prevent cross-block explosion
-        carry_grad = tl.where(carry_grad > 100.0, 100.0, carry_grad)
-        carry_grad = tl.where(carry_grad < -100.0, -100.0, carry_grad)
 
         if block_start > 0:
             carry_h_prev = tl.load(h_ptr + base_offset + (block_start - 1) * stride_l)
@@ -455,8 +468,11 @@ def dyadic_scan_triton_fast(u, nums):
     return h
 
 
-def dyadic_scan_backward_triton_fast(grad_h, h, nums):
-    """FAST backward dyadic scan assuming shift=15."""
+def dyadic_scan_backward_triton_fast(grad_h, h, u, nums):
+    """FAST backward dyadic scan for convex combination formulation.
+
+    Now requires u (input) for proper gradient computation.
+    """
     B, L, D = grad_h.shape
     grad_u = torch.empty_like(grad_h)
     grad_nums = torch.empty_like(grad_h)
@@ -472,7 +488,7 @@ def dyadic_scan_backward_triton_fast(grad_h, h, nums):
 
     grid = (B, D)
     dyadic_scan_bwd_parallel_kernel_fast[grid](
-        grad_h, h, nums,
+        grad_h, h, u, nums,
         grad_u, grad_nums,
         grad_h.stride(0), grad_h.stride(1), grad_h.stride(2),
         B, L, D,
