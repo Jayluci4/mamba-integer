@@ -268,8 +268,9 @@ class MambaIntegerBlock(nn.Module):
         self.dt_proj = BitLinear(dt_rank, d_inner)
         self.out_proj = BitLinear(d_inner, d_model)
         
-        # Initialize decay_nums for better gradient flow (decay ~0.96 instead of ~0.85)
-        self.base_decay_nums = nn.Parameter(torch.ones(d_inner, d_state) * 31500.0)
+        # Initialize decay_nums: balance gradient flow vs explosion (decay ~0.915)
+        # 28000 → vanishing, 31500 → exploding, 30000 → stable middle ground
+        self.base_decay_nums = nn.Parameter(torch.ones(d_inner, d_state) * 30000.0)
         self.register_buffer('decay_shifts', torch.ones(d_inner, d_state) * 15.0)
         self.res_gate = nn.Parameter(torch.ones(1) * 0.01) # Start small
 
