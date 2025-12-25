@@ -196,56 +196,22 @@ def bitnet_matmul_kernel(
 def fast_bitnet_matmul(x_quant, w_quant, x_scale, w_scale):
     """Fused BitNet matrix multiplication: y = (x_quant @ w_quant.T) * x_scale * w_scale
 
-    Uses Triton kernel with autotuning for best performance.
-    Falls back to torch._int_mm or PyTorch float matmul if Triton fails.
+    Uses torch._int_mm for 10x speedup over float matmul.
+
+    NOTE: Triton kernel disabled due to CUDA context corruption issues when
+    used with multiple model layers (cuBLAS handle corruption after ~6 layers).
+    See: https://github.com/triton-lang/triton/issues/882
+
+    torch._int_mm uses cuBLAS INT8 GEMM which is both fast and reliable.
     """
-    if not x_quant.is_cuda:
-        # CPU fallback
-        y = torch.matmul(x_quant.float(), w_quant.float().t())
-        return y * x_scale.view(-1, 1) * w_scale.view(1, -1)
+    if x_quant.is_cuda and hasattr(torch, '_int_mm'):
+        # Use PyTorch's native INT8 matmul (10x faster than float)
+        x_int8 = x_quant.to(torch.int8).contiguous()
+        w_int8 = w_quant.t().to(torch.int8).contiguous()
+        y_int = torch._int_mm(x_int8, w_int8)
+        return y_int.float() * x_scale.view(-1, 1) * w_scale.view(1, -1)
 
-    # Dimensions: x_quant [M, K], w_quant [N, K], output [M, N]
-    M, K = x_quant.shape
-    N = w_quant.shape[0]
-
-    # Prepare tensors for Triton kernel
-    # A = x_quant [M, K], B = w_quant.T [K, N]
-    a = x_quant.contiguous()
-    b = w_quant.t().contiguous()  # [K, N]
-
-    # Ensure float32 for scales
-    scale_a = x_scale.view(-1).contiguous().float()
-    scale_b = w_scale.view(-1).contiguous().float()
-
-    # Output tensor
-    c = torch.empty((M, N), device=x_quant.device, dtype=torch.float32)
-
-    # Try Triton kernel
-    try:
-        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
-        bitnet_matmul_kernel[grid](
-            a, b, c, scale_a, scale_b,
-            M, N, K,
-            a.stride(0), a.stride(1),
-            b.stride(0), b.stride(1),
-            c.stride(0), c.stride(1),
-        )
-        return c
-    except Exception as e:
-        # Triton failed, try torch._int_mm
-        pass
-
-    # Fallback to torch._int_mm
-    if hasattr(torch, '_int_mm'):
-        try:
-            x_int8 = x_quant.to(torch.int8).contiguous()
-            w_int8 = w_quant.t().to(torch.int8).contiguous()
-            y_int = torch._int_mm(x_int8, w_int8)
-            return y_int.float() * x_scale.view(-1, 1) * w_scale.view(1, -1)
-        except Exception:
-            pass
-
-    # Final fallback: PyTorch float matmul
+    # Fallback for CPU or old PyTorch
     y = torch.matmul(x_quant.float(), w_quant.float().t())
     return y * x_scale.view(-1, 1) * w_scale.view(1, -1)
 

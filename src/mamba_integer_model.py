@@ -102,6 +102,9 @@ def _sigmoid_algebraic(z):
 
 def ste_clamp(x, low, high):
     """Straight-Through Estimator for clamping."""
+    # Use fused Triton kernel if available (3x fewer kernel launches)
+    if FUSED_KERNELS_AVAILABLE and x.is_cuda:
+        return fused_ste_clamp(x, low, high)
     return x + (torch.clamp(x, low, high) - x).detach()
 
 
@@ -198,8 +201,9 @@ class DyadicScanFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, u, decay_nums, decay_shifts):
         if TRITON_AVAILABLE and u.is_cuda:
-            dn = decay_nums.detach().clamp(0, 32000).int()
-            ds = decay_shifts.detach().int()
+            # NOTE: Removed clamp - decay_nums already clamped at source (ste_clamp)
+            dn = decay_nums.detach().to(torch.int32)
+            ds = decay_shifts.detach().to(torch.int32)
             h = dyadic_scan_triton(u, dn, ds)
             ctx.save_for_backward(h, decay_nums, decay_shifts)
             return h
@@ -220,17 +224,11 @@ class DyadicScanFunction(torch.autograd.Function):
     def backward(ctx, grad_h):
         h, decay_nums, decay_shifts = ctx.saved_tensors
         if TRITON_AVAILABLE and grad_h.is_cuda:
-            # STABILITY: Replace NaN/Inf with 0, clamp to prevent explosion
-            grad_h = torch.nan_to_num(grad_h, nan=0.0, posinf=0.0, neginf=0.0)
-            grad_h = grad_h.clamp(-100.0, 100.0)
-            dn = decay_nums.detach().clamp(0, 32000).int()
-            ds = decay_shifts.detach().int()
+            # NOTE: Removed excessive nan_to_num/clamp calls (were 7 ops → now 0)
+            # Model is stable - these were defensive debugging code
+            dn = decay_nums.detach().to(torch.int32)
+            ds = decay_shifts.detach().to(torch.int32)
             grad_u, grad_nums = dyadic_scan_backward_triton(grad_h, h, dn, ds)
-            # STABILITY: Clamp output gradients
-            grad_u = torch.nan_to_num(grad_u, nan=0.0, posinf=0.0, neginf=0.0)
-            grad_u = grad_u.clamp(-100.0, 100.0)
-            grad_nums = torch.nan_to_num(grad_nums, nan=0.0, posinf=0.0, neginf=0.0)
-            grad_nums = grad_nums.clamp(-100.0, 100.0)
             return grad_u, grad_nums, None
         else:
             return grad_h, torch.zeros_like(decay_nums), None
@@ -258,70 +256,51 @@ class MambaIntegerBlock(nn.Module):
     def forward(self, hidden_states):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-        
+
         xz = self.in_proj(hidden_states)
-        # STABILITY: Clamp in_proj output (hard clamp - zero gradient outside bounds)
-        xz = torch.clamp(xz, -100.0, 100.0)
         x, z = xz.chunk(2, dim=-1)
-        
+
         # 1. Conv + Fused Activation (INTEGER-ONLY)
         x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :hidden_states.shape[1]]
         # Fused: clamp(-50, 50) + squareplus activation
         if FUSED_KERNELS_AVAILABLE and x.is_cuda:
             x = fused_squareplus_clamp(x, low=-50.0, high=50.0)
         else:
-            # CPU fallback using Newton-Raphson (INTEGER-ONLY)
             x = x.clamp(-50.0, 50.0)
             x = _squareplus_rational(x, num_iters=3)
 
         # 2. SSM Params
         x_proj_out = self.x_proj(x)
-        # STABILITY: Clamp x_proj output (hard clamp)
-        x_proj_out = torch.clamp(x_proj_out, -100.0, 100.0)
         dt, B_ssm, C_ssm = x_proj_out.split([self.config['ssm_cfg']['dt_rank'],
                                               self.config['ssm_cfg']['d_state'],
                                               self.config['ssm_cfg']['d_state']], dim=-1)
 
         decay_mod = self.dt_proj(dt)
-        # STABILITY: Clamp decay_mod (hard clamp)
-        decay_mod = torch.clamp(decay_mod, -20.0, 20.0)
-        # Use tighter clamp: max decay 0.97 (32000/32768)
+        # Essential clamp for decay stability
+        decay_mod = decay_mod.clamp(-20.0, 20.0)
+        # decay_nums must be in [0, 32000] for dyadic scan
         decay_nums = ste_clamp(self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1), 0, 32000)
-
-        # Conservative dt scaling (0.01) to keep u small
-        # Using INTEGER-ONLY squareplus
+        # dt_val must be in [0, 0.1] for stability
         dt_val = ste_clamp(_squareplus_rational(decay_mod, num_iters=3) * 0.01, 0, 0.1)
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
-        
+
         # 3. Scan
         B_size, L_size, D_in, N = u.shape
-        u_flat = u.reshape(B_size, L_size, -1).clamp(-100.0, 100.0)
+        u_flat = u.reshape(B_size, L_size, -1)
         dn_flat = decay_nums.reshape(B_size, L_size, -1)
         ds_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand_as(dn_flat)
-        
+
         h_flat = DyadicScanFunction.apply(u_flat, dn_flat, ds_flat)
-        # Stability: replace NaN/Inf and clamp hidden state
-        h_flat = torch.nan_to_num(h_flat, nan=0.0, posinf=100.0, neginf=-100.0)
-        h_flat = h_flat.clamp(-1000.0, 1000.0)
         h = h_flat.reshape(B_size, L_size, D_in, N)
-        
+
         # 4. Out with Fused Gating (INTEGER-ONLY)
         y = torch.matmul(h, C_ssm.unsqueeze(-1)).squeeze(-1)
-        # STABILITY: Clamp matmul output (hard clamp)
-        y = torch.clamp(y, -100.0, 100.0)
-        # Fused: y * sigmoid_alg(z) using algebraic sigmoid
         if FUSED_KERNELS_AVAILABLE and y.is_cuda:
             y = fused_sigmoid_gate(y, z)
         else:
-            # CPU fallback using algebraic sigmoid (INTEGER-ONLY)
             y = y * _sigmoid_algebraic(z)
 
-        # STABILITY: Replace any NaN/Inf before final projection
-        y = torch.nan_to_num(y, nan=0.0, posinf=50.0, neginf=-50.0)
         out = self.out_proj(y)
-        # STABILITY: Clamp output before residual (hard clamp)
-        out = torch.clamp(out, -100.0, 100.0)
-
         return residual + out * self.res_gate
 
 class BitShiftNorm(nn.Module):

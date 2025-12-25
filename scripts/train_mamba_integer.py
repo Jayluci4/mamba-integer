@@ -137,9 +137,11 @@ def train():
 
     print(f"Decay params: {len(decay_params)}, Other params: {len(other_params)}")
 
-    # Apply torch.compile for ~2x speedup (after getting param references)
-    print("Applying torch.compile (this may take a few minutes on first run)...")
-    model = torch.compile(model, mode='reduce-overhead')
+    # torch.compile disabled - conflicts with custom Triton kernels
+    # TODO: Re-enable after fixing kernel compatibility
+    # print("Applying torch.compile (this may take a few minutes on first run)...")
+    # model = torch.compile(model, mode='default')
+    print("Running without torch.compile (custom Triton kernels active)")
 
     # Learning rates
     optimizer = optim.AdamW([
