@@ -143,7 +143,7 @@ def train():
     # model = torch.compile(model, mode='default')
     print("Running without torch.compile (custom Triton kernels active)")
 
-    # Learning rates
+    # Learning rates: decay params at 10x (h clamping in scan kernel prevents explosion)
     optimizer = optim.AdamW([
         {'params': decay_params, 'lr': 5e-3, 'weight_decay': 0.0},
         {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.01}

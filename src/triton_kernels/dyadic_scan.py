@@ -341,10 +341,17 @@ def dyadic_scan_parallel_kernel_fast(
         scan_a, scan_b = tl.associative_scan((decay, u_vals), axis=0, combine_fn=combine_fn)
         h_vals = scan_a * carry_b + scan_b
 
+        # Clamp hidden state to prevent accumulation/explosion
+        h_vals = tl.where(h_vals > 100.0, 100.0, h_vals)
+        h_vals = tl.where(h_vals < -100.0, -100.0, h_vals)
+
         tl.store(h_ptr + ptr_offs, h_vals, mask=mask)
 
         last_idx = block_size - 1
         carry_b = tl.sum(tl.where(offs == last_idx, h_vals, 0.0))
+        # Clamp carry to prevent cross-block explosion
+        carry_b = tl.where(carry_b > 100.0, 100.0, carry_b)
+        carry_b = tl.where(carry_b < -100.0, -100.0, carry_b)
 
 
 @triton.jit
