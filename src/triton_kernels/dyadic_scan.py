@@ -127,11 +127,17 @@ def dyadic_scan_bwd_parallel_kernel(
 
     # Carry for gradient accumulation across blocks
     carry_grad = 0.0
-    # Carry for h_prev at block boundaries
-    carry_h_prev = 0.0
 
     # Process blocks in reverse order
     num_blocks = (L + BLOCK_L - 1) // BLOCK_L
+
+    # Initialize carry_h_prev: for the first iteration (last block in forward order),
+    # we need h[last_block_start - 1] where last_block_start = (num_blocks-1) * BLOCK_L
+    first_block_start = (num_blocks - 1) * BLOCK_L
+    if first_block_start > 0:
+        carry_h_prev = tl.load(h_ptr + base_offset + (first_block_start - 1) * stride_l)
+    else:
+        carry_h_prev = 0.0
 
     for block_idx in range(num_blocks - 1, -1, -1):
         block_start = block_idx * BLOCK_L
@@ -150,12 +156,6 @@ def dyadic_scan_bwd_parallel_kernel(
         # Compute decay
         decay_scale = tl.exp2(-shift_vals.to(tl.float32))
         decay = num_vals.to(tl.float32) * decay_scale
-
-        # Load h_prev for grad_nums computation (h[t-1] for each t)
-        h_prev_ptr_offs = base_offset + (block_start + offs - 1) * stride_l
-        h_prev = tl.load(h_ptr + h_prev_ptr_offs, mask=(mask & (offs > 0)), other=0.0)
-        # For offs == 0, h_prev comes from previous block
-        h_prev = tl.where(offs == 0, carry_h_prev, h_prev)
 
         # Backward scan: d_h_acc[t] = grad_h[t] + decay[t+1] * d_h_acc[t+1]
         # In reversed order, this becomes:
@@ -189,13 +189,16 @@ def dyadic_scan_bwd_parallel_kernel(
         tl.store(grad_u_ptr + base_offset + (block_start + rev_offs) * stride_l, d_h_acc_rev, mask=rev_mask)
 
         # Compute grad_nums: g_num[t] = d_h_acc[t] * h[t-1] * decay_scale[t]
+        # For forward position (block_start + rev_offs), we need h[block_start + rev_offs - 1]
         rev_decay_scale = tl.exp2(-rev_shift.to(tl.float32))
+
+        # Load h[t-1] for each position
+        # For rev_offs > 0: h[block_start + rev_offs - 1] is within the block
+        # For rev_offs == 0: h[block_start - 1] comes from carry_h_prev (previous block)
         rev_h_prev = tl.load(h_ptr + base_offset + (block_start + rev_offs - 1) * stride_l,
                              mask=(rev_mask & (rev_offs > 0)), other=0.0)
-        # Handle boundary: for rev_offs == 0, we need h from the next block (in forward order)
-        # This is the last element of current block's h, which we need to load
-        last_h_in_block = tl.load(h_ptr + base_offset + (block_start + block_size - 1) * stride_l)
-        rev_h_prev = tl.where(rev_offs == 0, last_h_in_block, rev_h_prev)
+        # For rev_offs == 0, use carry_h_prev which holds h[block_start - 1]
+        rev_h_prev = tl.where(rev_offs == 0, carry_h_prev, rev_h_prev)
 
         g_nums_rev = d_h_acc_rev * rev_h_prev * rev_decay_scale
         tl.store(grad_nums_ptr + base_offset + (block_start + rev_offs) * stride_l, g_nums_rev, mask=rev_mask)
@@ -205,7 +208,9 @@ def dyadic_scan_bwd_parallel_kernel(
         last_idx = block_size - 1
         carry_grad = tl.sum(tl.where(offs == last_idx, d_h_acc_rev, 0.0))
 
-        # Update h_prev carry: the h value just before this block
+        # Update h_prev carry for the NEXT iteration (earlier block in forward order)
+        # We need h[block_start - 1] for the next block's rev_offs==0 case
+        # But we load it NOW because next iteration won't have access to current block_start
         if block_start > 0:
             carry_h_prev = tl.load(h_ptr + base_offset + (block_start - 1) * stride_l)
         else:

@@ -9,113 +9,201 @@ from triton.language.extra.cuda import libdevice
 @triton.jit
 def quantize_activations_kernel(
     x_ptr, x_quant_ptr, scale_ptr,
-    stride_row, n_cols,
+    n_cols,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """Fused per-row activation quantization: abs-max + scale + round."""
-    pid = tl.program_id(0)  # Row index
-
-    # Compute pointers for this row
-    row_start = pid * stride_row
+    pid = tl.program_id(0)
+    # Correct row offset logic
+    row_start = pid * n_cols
     offsets = tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_cols
-
-    # Load row with mask
+    
+    # Load with mask to avoid illegal memory access
     x = tl.load(x_ptr + row_start + offsets, mask=mask, other=0.0)
-
-    # Compute abs-max for this row
+    
     abs_x = tl.abs(x)
     max_val = tl.max(abs_x, axis=0)
-    scale = tl.maximum(max_val, 1e-8)
+    scale = max_val if max_val > 1e-8 else 1e-8
+    
+    # Store scale (1 per row)
     tl.store(scale_ptr + pid, scale)
-
-    # Quantize: round(x * 127 / scale), clamp to [-127, 127]
+    
     q_factor = 127.0 / scale
     x_quant = libdevice.rint(x * q_factor)
     x_quant = tl.clamp(x_quant, -127.0, 127.0)
+    
+    # Store with mask
     tl.store(x_quant_ptr + row_start + offsets, x_quant, mask=mask)
 
-
 def fast_quantize_activations(x):
-    """Fused activation quantization using Triton kernel."""
-    # Ensure contiguous for kernel
-    x_contig = x.contiguous()
-    x_flat = x_contig.view(-1, x_contig.shape[-1])
+    x = x.contiguous()
+    x_flat = x.reshape(-1, x.shape[-1])
     n_rows, n_cols = x_flat.shape
-    x_quant = torch.empty_like(x_flat)
+    x_quant = torch.empty_like(x_flat, dtype=x.dtype)
     scale = torch.empty(n_rows, device=x.device, dtype=x.dtype)
-
     BLOCK_SIZE = triton.next_power_of_2(n_cols)
-    # Limit block size to avoid register pressure
-    BLOCK_SIZE = min(BLOCK_SIZE, 4096)
-
+    
     quantize_activations_kernel[(n_rows,)](
         x_flat, x_quant, scale,
-        x_flat.stride(0), n_cols,
+        n_cols,
         BLOCK_SIZE=BLOCK_SIZE
     )
     return x_quant.view_as(x), scale.view(*x.shape[:-1], 1) / 127.0
 
 # --- Fused BitNet MatMul Forward ---
+# Based on research:
+# - Use out_dtype=tl.int32 for int8 dot products
+# - Autotuning is essential for performance
+# - Proper L2 cache optimization via grouped ordering
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=3, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=4, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_stages=5, num_warps=2),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def bitnet_matmul_kernel(
+    # Pointers
     a_ptr, b_ptr, c_ptr, scale_a_ptr, scale_b_ptr,
+    # Dimensions
     M, N, K,
-    stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+    # Strides
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    # Block sizes (autotuned)
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 ):
+    """
+    Compute C = (A @ B) * scale_a * scale_b
+    A: [M, K] int8 (quantized activations)
+    B: [K, N] int8 (transposed quantized weights)
+    scale_a: [M] float32
+    scale_b: [N] float32
+    """
+    # Program ID with grouped ordering for L2 cache optimization
     pid = tl.program_id(axis=0)
-    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-    pid_m = pid % num_pid_m
-    pid_n = pid // num_pid_m
-    
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
-    
-    a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
-    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
-    
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.int32)
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        a = tl.load(a_ptrs).to(tl.int8)
-        b = tl.load(b_ptrs).to(tl.int8)
-        accumulator += tl.dot(a, b)
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += BLOCK_SIZE_K * stride_bk
-        
-    scale_a = tl.load(scale_a_ptr + offs_am)
-    scale_b = tl.load(scale_b_ptr + offs_bn)
-    
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # Grouped ordering: process tiles in groups to improve L2 locality
+    GROUP_M: tl.constexpr = 8
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    # Offsets for this block
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    # Pointers to first block of A and B
+    a_ptrs = a_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+    # Accumulator in int32 to prevent overflow
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+
+    # Main loop over K dimension
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        # Boundary masks
+        k_offs = k * BLOCK_K + offs_k
+        a_mask = (offs_m[:, None] < M) & (k_offs[None, :] < K)
+        b_mask = (k_offs[:, None] < K) & (offs_n[None, :] < N)
+
+        # Load blocks - cast to int8 for the dot product
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+        b = tl.load(b_ptrs, mask=b_mask, other=0.0)
+
+        # Int8 dot product with explicit int32 accumulator
+        accumulator += tl.dot(a.to(tl.int8), b.to(tl.int8), out_dtype=tl.int32)
+
+        # Advance pointers
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    # Load scales and apply
+    scale_a = tl.load(scale_a_ptr + offs_m, mask=offs_m < M, other=1.0)
+    scale_b = tl.load(scale_b_ptr + offs_n, mask=offs_n < N, other=1.0)
+
+    # Convert to float and apply scales
     c = accumulator.to(tl.float32) * scale_a[:, None] * scale_b[None, :]
-    
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-    offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+
+    # Write output
+    c_ptrs = c_ptr + (offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn)
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, c, mask=c_mask)
 
-# --- NEW: BitNet MatMul Backward (dL/dX) ---
-# Note: In training, we need dL/dX and dL/dW. 
-# Since W is ternary, grad flows to latent W. 
-# This is essentially standard MatMul but with scales applied.
+def fast_bitnet_matmul(x_quant, w_quant, x_scale, w_scale):
+    """Fused BitNet matrix multiplication: y = (x_quant @ w_quant.T) * x_scale * w_scale
+
+    Uses Triton kernel with autotuning for best performance.
+    Falls back to torch._int_mm or PyTorch float matmul if Triton fails.
+    """
+    if not x_quant.is_cuda:
+        # CPU fallback
+        y = torch.matmul(x_quant.float(), w_quant.float().t())
+        return y * x_scale.view(-1, 1) * w_scale.view(1, -1)
+
+    # Dimensions: x_quant [M, K], w_quant [N, K], output [M, N]
+    M, K = x_quant.shape
+    N = w_quant.shape[0]
+
+    # Prepare tensors for Triton kernel
+    # A = x_quant [M, K], B = w_quant.T [K, N]
+    a = x_quant.contiguous()
+    b = w_quant.t().contiguous()  # [K, N]
+
+    # Ensure float32 for scales
+    scale_a = x_scale.view(-1).contiguous().float()
+    scale_b = w_scale.view(-1).contiguous().float()
+
+    # Output tensor
+    c = torch.empty((M, N), device=x_quant.device, dtype=torch.float32)
+
+    # Try Triton kernel
+    try:
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),)
+        bitnet_matmul_kernel[grid](
+            a, b, c, scale_a, scale_b,
+            M, N, K,
+            a.stride(0), a.stride(1),
+            b.stride(0), b.stride(1),
+            c.stride(0), c.stride(1),
+        )
+        return c
+    except Exception as e:
+        # Triton failed, try torch._int_mm
+        pass
+
+    # Fallback to torch._int_mm
+    if hasattr(torch, '_int_mm'):
+        try:
+            x_int8 = x_quant.to(torch.int8).contiguous()
+            w_int8 = w_quant.t().to(torch.int8).contiguous()
+            y_int = torch._int_mm(x_int8, w_int8)
+            return y_int.float() * x_scale.view(-1, 1) * w_scale.view(1, -1)
+        except Exception:
+            pass
+
+    # Final fallback: PyTorch float matmul
+    y = torch.matmul(x_quant.float(), w_quant.float().t())
+    return y * x_scale.view(-1, 1) * w_scale.view(1, -1)
 
 def fast_bitnet_matmul_backward(grad_output, x_quant, w_quant, x_scale, w_scale):
-    """
-    dL/dX = (grad_output * w_scale) @ w_quant
-    dL/dW = (grad_output * x_scale)^T @ x_quant
-    """
-    # 1. Rescale grad_output for input gradient
-    # grad_output is [M, N], w_scale is [N]
-    # We need to apply scales before the core MatMul to keep it efficient
     g_scaled_x = grad_output * w_scale.view(1, -1)
     grad_x = torch.matmul(g_scaled_x, w_quant.float()) * x_scale.view(-1, 1)
-    
-    # 2. Rescale grad_output for weight gradient
     g_scaled_w = grad_output * x_scale.view(-1, 1)
     grad_w = torch.matmul(g_scaled_w.t(), x_quant.float()) * w_scale.view(-1, 1)
-    
     return grad_x, grad_w
 
 # --- Optimized BitShiftNorm ---
@@ -142,14 +230,13 @@ def bitshift_norm_kernel(
     if k < 0.0: k = 0.0
     scale = tl.exp2(-k)
     
-    # Store inv_rms for backward (reuse the dyadic scale)
     tl.store(inv_rms_ptr + pid, scale)
-    
     gamma = tl.load(gamma_ptr + offsets, mask=mask, other=1.0)
     tl.store(row_ptr_out + offsets, x_centered * scale * gamma, mask=mask)
 
 def fast_bitshift_norm(x, gamma):
-    x_flat = x.view(-1, x.shape[-1])
+    x = x.contiguous()
+    x_flat = x.reshape(-1, x.shape[-1])
     n_rows, n_cols = x_flat.shape
     out = torch.empty_like(x_flat)
     inv_rms = torch.empty(n_rows, device=x.device, dtype=x.dtype)

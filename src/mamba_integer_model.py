@@ -1,313 +1,190 @@
 
 import torch
 import torch.nn as nn
-import ctypes
 import os
 import math
 import sys
 
-# Add path for rational_bitnet
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../bitnet-odp/src'))
-sys.path.insert(0, os.path.dirname(__file__)) 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-
+# Setup Path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../bitnet-odp/src")))
 from rational_bitnet import BitLinear
 
-# --- Load Kernels ---
-def load_lib(name):
-    path = os.path.join(os.path.dirname(__file__), f"cuda_kernels/lib{name}.so")
-    # Disable ctypes for torch.compile compatibility
-    return None 
-    # if os.path.exists(path):
-    #    return ctypes.CDLL(path)
-    # return None
-
-lib_bitshift = load_lib("bitshift_norm")
-lib_squareplus = load_lib("squareplus")
-import sys
-import os
-# Ensure src is in path for triton_kernels package
-sys.path.append(os.path.dirname(__file__))
-from triton_kernels.dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
+# Triton
 try:
+    sys.path.append(os.path.dirname(__file__))
+    from triton_kernels.dyadic_scan import dyadic_scan_triton, dyadic_scan_backward_triton
     from triton_kernels.bitnet_kernels import fast_bitshift_norm
-    BITSHIFT_TRITON_AVAILABLE = True
-    print("DEBUG: Triton BitNet Kernels Loaded Successfully.")
+    TRITON_AVAILABLE = True
+    print("DEBUG: Triton Mamba Kernels Loaded.")
 except ImportError as e:
-    BITSHIFT_TRITON_AVAILABLE = False
-    print(f"DEBUG: Triton BitNet Kernels Failed to Load: {e}")
+    TRITON_AVAILABLE = False
+    print(f"DEBUG: Triton Mamba Kernels Failed: {e}")
 
-# Setup library path for custom CUDA kernels
-LIB_PATH = os.path.join(os.path.dirname(__file__), "cuda_kernels/libdyadic_mamba.so")
-lib_scan = None
-# if os.path.exists(LIB_PATH):
-#    print(f"DEBUG: Found CUDA Library at {LIB_PATH}")
-#    lib_scan = ctypes.CDLL(LIB_PATH)
-# else:
-#    print(f"DEBUG: CUDA Library NOT FOUND at {LIB_PATH}")
-#    lib_scan = None
+# --- Autograd ---
 
-# --- Autograd Functions ---
+def ste_clamp(x, low, high):
+    """Straight-Through Estimator for clamping."""
+    return x + (torch.clamp(x, low, high) - x).detach()
 
 class BitShiftNormFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, gamma, scale_bits=0):
-        B, S, D = x.shape
-        out = torch.empty_like(x)
+    def forward(ctx, x, gamma):
+        # Always compute centered x for consistent backward pass
+        x_centered = x - x.mean(dim=-1, keepdim=True)
 
-        if BITSHIFT_TRITON_AVAILABLE and x.is_cuda:
-            # Use Fused Triton Kernel (Fast)
+        if TRITON_AVAILABLE and x.is_cuda:
+            # Triton kernel handles centering internally, but we need centered x for backward
             y, inv_rms = fast_bitshift_norm(x, gamma)
-            ctx.save_for_backward(x, gamma, inv_rms)
+            ctx.save_for_backward(x_centered, gamma, inv_rms)
             return y
-        elif lib_bitshift and x.is_cuda:
-            # ... existing ctypes logic ...
-            pass
         else:
-            # CPU Fallback - optimized single-pass computation
-            # Compute variance directly (x is already mean-centered from BitShiftNorm.forward)
-            var = (x * x).mean(dim=-1, keepdim=True)
-            # Use fast bit operations: log2(sqrt(var)) = 0.5 * log2(var)
-            # Avoid sqrt by using: k = round(0.5 * log2(var))
-            k = torch.round(0.5 * torch.log2(var + 1e-9)).int()
-            k = torch.clamp(k, min=0, max=15)  # Clamp to reasonable range
-            inv_rms = torch.pow(2.0, -k.float())
-            out = x * inv_rms * gamma
-            ctx.save_for_backward(x, gamma, inv_rms)
-            return out
+            var = x_centered.pow(2).mean(dim=-1, keepdim=True)
+            rms = torch.sqrt(var + 1e-6)
+            k = torch.round(torch.log2(rms)).int().clamp(min=0)
+            inv_rms = 1.0 / (2.0 ** k.float())
+            ctx.save_for_backward(x_centered, gamma, inv_rms)
+            return x_centered * inv_rms * gamma
 
     @staticmethod
     def backward(ctx, grad_output):
-        x, gamma, inv_rms = ctx.saved_tensors
-        # Reshape inv_rms to match [B, S, 1] if it was returned as [B*S]
+        x_centered, gamma, inv_rms = ctx.saved_tensors
         if inv_rms.dim() == 1:
-            inv_rms = inv_rms.view(*x.shape[:-1], 1)
-            
-        # ANALYTIC GRADIENT (Zero Overhead)
-        # Using inv_rms calculated in forward pass (already dyadic!)
+            inv_rms = inv_rms.view(*x_centered.shape[:-1], 1)
+
         grad_output_scaled = grad_output * gamma
-        
-        # dL/dX
-        # Standard RMSNorm grad logic but with our discrete inv_rms
-        D = x.size(-1)
+        D = x_centered.size(-1)
         term1 = grad_output_scaled * inv_rms
-        dot = (grad_output_scaled * x).sum(dim=-1, keepdim=True)
-        term2 = x * dot * (inv_rms * inv_rms * inv_rms) / D
-        grad_x = term1 - term2
-        
-        # dL/dGamma
-        grad_gamma = (grad_output * x * inv_rms).sum(dim=(0, 1))
-        
-        return grad_x, grad_gamma, None
-
-class SquareplusFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        B, S, D = x.shape
-        out = torch.empty_like(x)
-        if lib_squareplus and x.is_cuda:
-            lib_squareplus.launch_squareplus(
-                ctypes.c_void_p(x.contiguous().data_ptr()),
-                ctypes.c_void_p(out.data_ptr()),
-                ctypes.c_int(B), ctypes.c_int(S), ctypes.c_int(D)
-            )
-        else:
-            out = 0.5 * (x + torch.sqrt(x*x + 4.0))
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, = ctx.saved_tensors
-        z = torch.sqrt(x*x + 4.0)
-        grad_x = grad_output * 0.5 * (1.0 + x / z)
-        return grad_x
-
-class RationalSigmoidFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        z = torch.sqrt(x*x + 1.0)
-        out = 0.5 * (1.0 + x / z)
-        ctx.save_for_backward(x, z)
-        return out
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, z = ctx.saved_tensors
-        grad_x = grad_output * 0.5 / (z * z * z)
-        return grad_x
+        dot = (grad_output_scaled * x_centered).sum(dim=-1, keepdim=True)
+        term2 = x_centered * dot * (inv_rms ** 3).clamp(-10.0, 10.0) / D
+        grad_gamma = (grad_output * x_centered * inv_rms).sum(dim=(0, 1))
+        return term1 - term2, grad_gamma
 
 class DyadicScanFunction(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, u, decay_nums_float, decay_shifts, scale_bits=15):
-        ctx.scale_bits = scale_bits
-        B, L, D = u.shape
-        
-        u_c = u.contiguous()
-        d_n_c = decay_nums_float.contiguous().int()
-        d_s_c = decay_shifts.contiguous().int()
-        
-        # Always use Triton for speed + compilation support
-        h = dyadic_scan_triton(u_c, d_n_c, d_s_c, scale_bits)
-            
-        ctx.save_for_backward(h, decay_nums_float, decay_shifts)
-        return h
+    def forward(ctx, u, decay_nums, decay_shifts):
+        if TRITON_AVAILABLE and u.is_cuda:
+            # Stricter clamp for forward stability
+            dn = decay_nums.detach().clamp(0, 32000).int()
+            ds = decay_shifts.detach().int()
+            h = dyadic_scan_triton(u, dn, ds)
+            ctx.save_for_backward(h, decay_nums, decay_shifts)
+            return h
+        else:
+            # CPU Fallback
+            B, L, DN = u.shape
+            h_acc = torch.zeros(B, DN, device=u.device)
+            h_list = []
+            decay = decay_nums / (2.0 ** decay_shifts)
+            for t in range(L):
+                h_acc = h_acc * decay[:, t] + u[:, t]
+                h_list.append(h_acc)
+            h_seq = torch.stack(h_list, dim=1)
+            ctx.save_for_backward(h_seq, decay_nums, decay_shifts)
+            return h_seq
 
     @staticmethod
     def backward(ctx, grad_h):
-        h, decay_nums_float, decay_shifts = ctx.saved_tensors
-        
-        # Ensure contiguous inputs
-        grad_h_c = grad_h.contiguous()
-        h_c = h.contiguous()
-        d_n_c = decay_nums_float.contiguous().int()
-        d_s_c = decay_shifts.contiguous().int()
-        
-        # Use Triton backward for full inductor fusion
-        grad_u, grad_decay = dyadic_scan_backward_triton(
-            grad_h_c, h_c, d_n_c, d_s_c, ctx.scale_bits
-        )
-        return grad_u, grad_decay, None, None
-
-# --- Modules ---
-
-class BitShiftNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.gamma = nn.Parameter(torch.ones(dim))
-        self.register_buffer('last_k', torch.tensor(0.0))
-
-    def forward(self, x):
-        # Fused mean centering - compute once and reuse
-        mean = x.mean(dim=-1, keepdim=True)
-        x_centered = x - mean
-        return BitShiftNormFunction.apply(x_centered, self.gamma)
-
-class DampenedSquareplus(nn.Module):
-    def forward(self, x):
-        # Dampen by 0.5 to prevent gain > 1
-        return 0.5 * SquareplusFunction.apply(x)
-
-class RationalSigmoid(nn.Module):
-    def forward(self, x): return RationalSigmoidFunction.apply(x)
-
-# --- Full Block ---
+        h, decay_nums, decay_shifts = ctx.saved_tensors
+        if TRITON_AVAILABLE and grad_h.is_cuda:
+            # Replace NaN with 0, use wider clamp to preserve gradient magnitude
+            grad_h = torch.nan_to_num(grad_h, 0.0).clamp(-100.0, 100.0)
+            dn = decay_nums.detach().clamp(0, 32000).int()
+            ds = decay_shifts.detach().int()
+            grad_u, grad_nums = dyadic_scan_backward_triton(grad_h, h, dn, ds)
+            # Clamp output gradients to prevent explosion but preserve learning
+            grad_u = torch.nan_to_num(grad_u, 0.0).clamp(-100.0, 100.0)
+            grad_nums = torch.nan_to_num(grad_nums, 0.0).clamp(-100.0, 100.0)
+            return grad_u, grad_nums, None
+        else:
+            return grad_h, torch.zeros_like(decay_nums), None
 
 class MambaIntegerBlock(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
-        d_model = config['d_model']
-        d_inner = d_model * 2 
+        d_model, d_state = config['d_model'], config['ssm_cfg']['d_state']
+        d_inner = d_model * 2
         dt_rank = config['ssm_cfg']['dt_rank']
-        d_state = config['ssm_cfg']['d_state']
         
         self.norm = BitShiftNorm(d_model)
         self.in_proj = BitLinear(d_model, d_inner * 2)
-        self.conv1d = nn.Conv1d(in_channels=d_inner, out_channels=d_inner, bias=True, kernel_size=4, groups=d_inner, padding=3)
-        
-        # Rational Squareplus (Restored)
-        self.activation = DampenedSquareplus()
-        self.gate_activation = RationalSigmoid()
-        self.register_buffer('last_act_max', torch.tensor(0.0))
-        
+        self.conv1d = nn.Conv1d(d_inner, d_inner, 4, groups=d_inner, padding=3)
         self.x_proj = BitLinear(d_inner, dt_rank + 2 * d_state)
         self.dt_proj = BitLinear(dt_rank, d_inner)
-        nn.init.normal_(self.dt_proj.weight, mean=0.0, std=0.001)
-        if self.dt_proj.bias is not None:
-            nn.init.zeros_(self.dt_proj.bias)
         self.out_proj = BitLinear(d_inner, d_model)
         
-        # Scale Output Weights (0.1)
-        nn.init.normal_(self.out_proj.weight, mean=0.0, std=0.02 / math.sqrt(config['n_layer']))
-        
-        from dyadic_hippo import get_hippo_s4d_real, project_to_dyadic
-        A_ref = get_hippo_s4d_real(d_state)
-        nums, shifts = project_to_dyadic(A_ref, scale_bits=15)
-        self.base_decay_nums = nn.Parameter(nums.float().unsqueeze(0).repeat(d_inner, 1))
-        self.register_buffer('decay_shifts', shifts.unsqueeze(0).repeat(d_inner, 1))
-        
-        # ReZero
-        self.res_gate = nn.Parameter(torch.zeros(1))
+        # Initialize decay_nums slightly lower for stability
+        self.base_decay_nums = nn.Parameter(torch.ones(d_inner, d_state) * 28000.0)
+        self.register_buffer('decay_shifts', torch.ones(d_inner, d_state) * 15.0)
+        self.res_gate = nn.Parameter(torch.ones(1) * 0.01) # Start small
 
     def forward(self, hidden_states):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
-
+        
         xz = self.in_proj(hidden_states)
         x, z = xz.chunk(2, dim=-1)
-
-        # Fused transpose-conv-transpose
-        x_t = x.transpose(1, 2)
-        x_t = self.conv1d(x_t)[:, :, :hidden_states.shape[1]]
-        x = x_t.transpose(1, 2)
-
-        x = self.activation(x)
-
-        x_dbl = self.x_proj(x)
-        dt_rank = self.config['ssm_cfg']['dt_rank']
-        d_state = self.config['ssm_cfg']['d_state']
-        dt, B_ssm, C_ssm = x_dbl.split([dt_rank, d_state, d_state], dim=-1)
-
+        
+        # 1. Conv
+        x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :hidden_states.shape[1]]
+        # Stability: clamp conv output
+        x = x.clamp(-50.0, 50.0)
+        x = 0.5 * (x + torch.sqrt(x*x + 4.0)) # Squareplus
+        
+        # 2. SSM Params
+        dt, B_ssm, C_ssm = self.x_proj(x).split([self.config['ssm_cfg']['dt_rank'], 
+                                                 self.config['ssm_cfg']['d_state'], 
+                                                 self.config['ssm_cfg']['d_state']], dim=-1)
+        
         decay_mod = self.dt_proj(dt)
-        # Fused add and clamp
-        decay_nums = (self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1)).clamp(0, 32767)
-
-        # Fused activation and scaling
-        dt_val = self.activation(decay_mod) * 0.1
-
-        # Fused multiplication
+        # Use tighter clamp: max decay 0.97 (32000/32768)
+        decay_nums = ste_clamp(self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1), 0, 32000)
+        
+        # Conservative dt scaling (0.01) to keep u small
+        dt_val = ste_clamp(0.5 * (decay_mod + torch.sqrt(decay_mod*decay_mod + 4.0)) * 0.01, 0, 0.1)
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
-
-        B_size, L_size, D_in = x.shape
-        flat_dim = D_in * d_state
-
-        # Optimized reshaping (use view instead of reshape when possible)
-        u_flat = u.reshape(B_size, L_size, flat_dim)
-        decay_nums_flat = decay_nums.reshape(B_size, L_size, flat_dim)
-        # Pre-compute decay_shifts expansion (avoid repeated expand)
-        decay_shifts_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand(B_size, L_size, flat_dim)
-
-        h_flat = DyadicScanFunction.apply(u_flat, decay_nums_flat, decay_shifts_flat, 15)
-        # Clamping (non-inplace for autograd compatibility)
-        h_flat = h_flat.clamp(-32000, 32000)
-
-        h = h_flat.reshape(B_size, L_size, D_in, d_state)
-        # Optimized matmul instead of einsum for better compilation
-        y = (h * C_ssm.unsqueeze(2)).sum(dim=-1)
-
-        # Fused gate activation and multiplication
-        z_gate = self.gate_activation(z)
-        y = y * z_gate
-
+        
+        # 3. Scan
+        B_size, L_size, D_in, N = u.shape
+        u_flat = u.reshape(B_size, L_size, -1).clamp(-100.0, 100.0)
+        dn_flat = decay_nums.reshape(B_size, L_size, -1)
+        ds_flat = self.decay_shifts.view(-1).unsqueeze(0).unsqueeze(0).expand_as(dn_flat)
+        
+        h_flat = DyadicScanFunction.apply(u_flat, dn_flat, ds_flat)
+        # Stability: clamp hidden state
+        h_flat = h_flat.clamp(-1000.0, 1000.0)
+        h = h_flat.reshape(B_size, L_size, D_in, N)
+        
+        # 4. Out
+        y = torch.matmul(h, C_ssm.unsqueeze(-1)).squeeze(-1)
+        y = y * (0.5 * (z / torch.sqrt(z*z + 1.0) + 1.0)) # Sigmoid
+        
         out = self.out_proj(y)
-        # Clamping (non-inplace for autograd compatibility)
-        out = out.clamp(-32000, 32000)
 
-        # Fused residual add with scaling
         return residual + out * self.res_gate
 
-from torch.utils.checkpoint import checkpoint
+class BitShiftNorm(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(dim))
+    def forward(self, x):
+        x = x - x.mean(dim=-1, keepdim=True)
+        return BitShiftNormFunction.apply(x, self.gamma)
 
 class MambaIntegerModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config['vocab_size'], config['d_model'])
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.02)
         self.layers = nn.ModuleList([MambaIntegerBlock(config, i) for i in range(config['n_layer'])])
         self.norm_f = BitShiftNorm(config['d_model'])
         self.lm_head = BitLinear(config['d_model'], config['vocab_size'])
+        self.output_scale = 1.0 / math.sqrt(config['d_model'])
         self.gradient_checkpointing = False
         
     def forward(self, input_ids):
         x = self.embedding(input_ids)
         for layer in self.layers:
-            if self.gradient_checkpointing and self.training:
-                # Use torch.utils.checkpoint to save memory
-                # Note: x must require_grad for checkpointing to work
-                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
-            else:
-                x = layer(x)
-        x = self.norm_f(x)
-        logits = self.lm_head(x)
+            x = layer(x)
+        logits = self.lm_head(self.norm_f(x)) * self.output_scale
         return logits

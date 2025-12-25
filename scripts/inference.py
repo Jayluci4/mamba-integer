@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/mamba_integer_step_3500.pt"
+MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/mamba_integer_step_4500.pt"
 
 if not os.path.exists(MODEL_PATH):
     print(f"Error: Could not find {MODEL_PATH}")
@@ -68,7 +68,15 @@ def run_inference():
     # 1. Load Model
     model = MambaIntegerModel(config).to(device)
     try:
-        state_dict = torch.load(MODEL_PATH, map_location=device)
+        checkpoint = torch.load(MODEL_PATH, map_location=device)
+        
+        # Handle Nested Dictionary (New Format)
+        if "model_state_dict" in checkpoint:
+            print("Detected nested checkpoint format.")
+            state_dict = checkpoint["model_state_dict"]
+        else:
+            state_dict = checkpoint
+            
         # Fix for torch.compile prefix
         new_state_dict = {}
         for k, v in state_dict.items():
@@ -76,7 +84,7 @@ def run_inference():
                 new_state_dict[k[10:]] = v
             else:
                 new_state_dict[k] = v
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(new_state_dict, strict=False)
         print("Model loaded successfully.")
     except Exception as e:
         print(f"Failed to load model: {e}")
