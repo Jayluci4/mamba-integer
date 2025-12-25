@@ -64,8 +64,8 @@ else
     BITNET_PATH=""
 fi
 
-# Ensure src is in PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:$REPO_ROOT/src:$BITNET_PATH"
+# Ensure src and root are in PYTHONPATH
+export PYTHONPATH="$PYTHONPATH:$REPO_ROOT:$REPO_ROOT/src:$BITNET_PATH"
 echo "PYTHONPATH set to: $PYTHONPATH"
 
 echo "--- Phase 3: Build & Data Preparation ---"
