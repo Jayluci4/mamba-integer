@@ -109,6 +109,36 @@ def validate_checkpoint_integrity(checkpoint, model, device):
     return issues
 
 
+def warmup_triton_kernels(model, config, device='cuda'):
+    """Pre-compile all Triton kernel variants to avoid mid-training hangs.
+
+    P0 FIX: Triton autotuning with torch.cuda.synchronize() can cause hangs
+    when kernels are compiled during training. By warming up with various
+    sequence lengths upfront, we ensure all kernel variants are pre-compiled.
+    """
+    print("Warming up Triton kernels...")
+    model.eval()
+    with torch.no_grad():
+        for seq_len in [64, 128, 256, 512]:
+            x = torch.randint(0, config['vocab_size'], (2, seq_len), device=device)
+            try:
+                _ = model(x)
+                torch.cuda.synchronize()
+                print(f"  Warmup pass seq_len={seq_len} complete")
+            except Exception as e:
+                print(f"  Warmup warning (seq_len={seq_len}): {e}")
+
+    # Also warm up backward pass
+    model.train()
+    x = torch.randint(0, config['vocab_size'], (2, 256), device=device)
+    logits = model(x)
+    loss = logits.sum()
+    loss.backward()
+    model.zero_grad()
+    torch.cuda.synchronize()
+    print("Triton kernel warmup complete (forward + backward)")
+
+
 def train():
     print("--- High Efficiency Mamba-Integer V2 Training ---")
     torch.set_float32_matmul_precision('high')
@@ -143,15 +173,18 @@ def train():
     # model = torch.compile(model, mode='default')
     print("Running without torch.compile (custom Triton kernels active)")
 
-    # Learning rates: decay params at 10x (h clamping in scan kernel prevents explosion)
+    # P1 FIX: Increased learning rate for other_params from 5e-4 to 1e-3
+    # SSM models (Mamba, minGRU) typically need higher LR than transformers
+    # decay_params at 5x (was 10x) relative to other_params
     optimizer = optim.AdamW([
         {'params': decay_params, 'lr': 5e-3, 'weight_decay': 0.0},
-        {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.01}
+        {'params': other_params, 'lr': 1e-3, 'weight_decay': 0.01}
     ])
 
     total_opt_steps = 15000
+    # P1 FIX: Updated max_lr to match new base LR (1e-3 for other_params)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=[5e-3, 5e-4], total_steps=total_opt_steps, pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
+        optimizer, max_lr=[5e-3, 1e-3], total_steps=total_opt_steps, pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
     )
 
     # --- Auto-Resume Logic (with validation) ---
@@ -208,13 +241,13 @@ def train():
                     except Exception as e:
                         print(f"ERROR loading optimizer/scheduler: {e}")
                         print("Creating fresh optimizer/scheduler and warming up...")
-                        # Recreate optimizer and scheduler
+                        # Recreate optimizer and scheduler with P1 FIX learning rates
                         optimizer = optim.AdamW([
                             {'params': decay_params, 'lr': 5e-3, 'weight_decay': 0.0},
-                            {'params': other_params, 'lr': 5e-4, 'weight_decay': 0.01}
+                            {'params': other_params, 'lr': 1e-3, 'weight_decay': 0.01}
                         ])
                         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, max_lr=[5e-3, 5e-4], total_steps=total_opt_steps,
+                            optimizer, max_lr=[5e-3, 1e-3], total_steps=total_opt_steps,
                             pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
                         )
                         # Fast-forward scheduler
@@ -260,6 +293,9 @@ def train():
     gradient_accumulation_steps = 32
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
+    # P0 FIX: Warmup Triton kernels to prevent mid-training hangs
+    warmup_triton_kernels(model, config, device)
+
     # 4. Training Loop with NaN detection
     model.train()
     start_time = time.time()
@@ -294,9 +330,25 @@ def train():
         # Gradient clipping
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
+        # P2 FIX: Gradient health monitoring - check for NaN/Inf before optimizer step
+        grad_healthy = True
+        if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+            print(f"Step {opt_step}: WARNING - NaN/Inf gradient norm detected, skipping update", flush=True)
+            grad_healthy = False
+            optimizer.zero_grad()
+        else:
+            # Check individual parameter gradients for NaN (detailed check every 100 steps)
+            if opt_step % 100 == 0:
+                nan_params = []
+                for name, p in model.named_parameters():
+                    if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                        nan_params.append(name)
+                if nan_params:
+                    print(f"Step {opt_step}: WARNING - NaN/Inf in gradients: {nan_params[:3]}...", flush=True)
+
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
         # Logging and NaN detection
         elapsed = time.time() - last_log_time
