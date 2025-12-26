@@ -51,17 +51,27 @@ except ImportError as e:
 try:
     from triton_kernels.ssd_chunk import dyadic_scan_ssd
     SSD_AVAILABLE = True
-    print("DEBUG: Mamba-2 SSD Loaded (chunked matmul for tensor cores).")
+    print("DEBUG: Mamba-2 SSD (naive) Loaded.")
 except ImportError as e:
     SSD_AVAILABLE = False
-    print(f"DEBUG: Mamba-2 SSD not available: {e}")
+    print(f"DEBUG: Mamba-2 SSD (naive) not available: {e}")
 
-# S1 FIX: SSD is available but disabled by default due to memory requirements
-# The naive SSD implementation builds [B, chunks, D, chunk_size, chunk_size] matrices
-# For large D (d_inner * d_state = 24K), this exceeds GPU memory
-# TODO: Implement memory-efficient SSD using sequential chunk processing
-# To enable: MAMBA_USE_SSD=1 (experimental, may OOM on large models)
-USE_SSD = False  # Disabled until memory-efficient version is implemented
+# S1 FIX: Memory-efficient multi-head SSD
+# Uses scalar A per head instead of matrix A, reducing memory by 1000x
+# L matrix: [B, n_heads, n_chunks, cs, cs] = 6.3 MB vs [B, n_chunks, D, cs, cs] = 6.4 GB
+try:
+    from triton_kernels.ssd_multihead import MambaIntegerBlockV2, ssd_multihead
+    SSD_MULTIHEAD_AVAILABLE = True
+    print("DEBUG: Mamba-2 SSD Multi-head Loaded (memory-efficient, 1000x reduction).")
+except ImportError as e:
+    SSD_MULTIHEAD_AVAILABLE = False
+    print(f"DEBUG: Mamba-2 SSD Multi-head not available: {e}")
+
+# S1 FIX: Use multi-head SSD by default when available
+# The naive SSD builds [B, chunks, D, chunk_size, chunk_size] matrices causing OOM
+# Multi-head SSD uses scalar A per head, reducing memory to 6.3 MB
+USE_SSD = False  # Legacy naive SSD (disabled)
+USE_SSD_MULTIHEAD = True  # Memory-efficient multi-head SSD (enabled)
 
 
 # --- Integer-Only Math Functions ---
@@ -458,7 +468,16 @@ class MambaIntegerModel(nn.Module):
         super().__init__()
         self.config = config
         self.embedding = nn.Embedding(config['vocab_size'], config['d_model'])
-        self.layers = nn.ModuleList([MambaIntegerBlock(config, i) for i in range(config['n_layer'])])
+
+        # S1 FIX: Use memory-efficient multi-head SSD block when enabled
+        use_ssd = config.get('ssm_cfg', {}).get('use_ssd', False)
+        if use_ssd and SSD_MULTIHEAD_AVAILABLE and USE_SSD_MULTIHEAD:
+            print(f"Using MambaIntegerBlockV2 (multi-head SSD) for {config['n_layer']} layers")
+            self.layers = nn.ModuleList([MambaIntegerBlockV2(config, i) for i in range(config['n_layer'])])
+        else:
+            print(f"Using MambaIntegerBlock (dyadic scan) for {config['n_layer']} layers")
+            self.layers = nn.ModuleList([MambaIntegerBlock(config, i) for i in range(config['n_layer'])])
+
         self.norm_f = BitShiftNorm(config['d_model'])
         self.lm_head = BitLinear(config['d_model'], config['vocab_size'])
         self.output_scale = 1.0 / math.sqrt(config['d_model'])
