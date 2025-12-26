@@ -18,8 +18,8 @@ import os
 import math
 import sys
 
-# Setup Path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../bitnet-odp/src")))
+# Setup Path - use local rational_bitnet.py (no external dependencies)
+sys.path.insert(0, os.path.dirname(__file__))
 from rational_bitnet import BitLinear
 
 # Triton

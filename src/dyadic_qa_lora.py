@@ -5,8 +5,8 @@ import math
 import sys
 import os
 
-# Add path to find rational_bitnet
-sys.path.append("../bitnet-odp/src")
+# Add path to find rational_bitnet (use local copy)
+sys.path.insert(0, os.path.dirname(__file__))
 from rational_bitnet import BitLinear, activation_quant_dynamic, ste_round
 
 class DyadicQALoRA(nn.Module):

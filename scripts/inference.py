@@ -1,26 +1,60 @@
 import torch
 import torch.nn as nn
-from src.mamba_integer_model import MambaIntegerModel
 import json
 import os
 import sys
 import numpy as np
+import glob
 
 # Add path for src
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
+from mamba_integer_model import MambaIntegerModel
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
-MODEL_PATH = "/home/jayantlohia16/experiment/mamba-integer/mamba_integer_step_4500.pt"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
-if not os.path.exists(MODEL_PATH):
-    print(f"Error: Could not find {MODEL_PATH}")
+# Auto-detect latest checkpoint
+def find_latest_checkpoint():
+    """Find the latest checkpoint by step number."""
+    ckpt_pattern = os.path.join(PROJECT_ROOT, "mamba_integer_step_*.pt")
+    ckpts = glob.glob(ckpt_pattern)
+
+    if not ckpts:
+        # Try final checkpoint
+        final = os.path.join(PROJECT_ROOT, "mamba_integer_final.pt")
+        if os.path.exists(final):
+            return final
+        return None
+
+    # Sort by step number
+    ckpts_with_step = []
+    for ckpt in ckpts:
+        try:
+            step = int(os.path.basename(ckpt).replace(".pt", "").split("_")[-1])
+            ckpts_with_step.append((step, ckpt))
+        except:
+            pass
+
+    if not ckpts_with_step:
+        return None
+
+    ckpts_with_step.sort(reverse=True)
+    return ckpts_with_step[0][1]
+
+MODEL_PATH = find_latest_checkpoint()
+if MODEL_PATH is None:
+    print(f"Error: No checkpoint found in {PROJECT_ROOT}")
+    print("Run training first: python scripts/train_mamba_integer.py")
+    sys.exit(1)
+else:
+    print(f"Using checkpoint: {MODEL_PATH}")
 
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
 # --- Rust Tokenizer ---
-from src.rust_tokenizer import get_rust_tokenizer
+from rust_tokenizer import get_rust_tokenizer
 MERGES_PATH = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
 rust_tokenizer = get_rust_tokenizer()
 if os.path.exists(MERGES_PATH):

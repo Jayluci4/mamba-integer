@@ -10,13 +10,11 @@ import time
 import os
 import sys
 
-# Add path for rational_bitnet
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../bitnet-odp/src'))
-# Add path for src
+# Add path for src (no external dependencies)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 # --- Config ---
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../../configs/config_mamba_integer_l4.json")
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
 # Use the pre-trained base model
 PRETRAINED_PATH = "mamba_integer_final.pt"
 

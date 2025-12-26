@@ -4,19 +4,38 @@ import struct
 import os
 import sys
 import json
+import glob
 
-# Add paths
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../bitnet-odp/src'))
-sys.path.insert(0, os.path.dirname(__file__)) 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+# Add paths (no external dependencies)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
 
 from mamba_integer_model import MambaIntegerModel
 from rational_bitnet import weight_quant_ternary
 
-CONFIG_PATH = "config_mamba_integer_l4.json"
-# Use the stable 1000 step checkpoint
-CHECKPOINT_PATH = "/home/jayantlohia16/experiment/gemma-intelligent/conv/src/dyadic_experiment/mamba/mamba_integer_step_1000.pt"
-OUTPUT_BIN = "mamba_integer_1000.bin"
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "configs/config_mamba_integer_l4.json")
+
+# Auto-detect latest checkpoint
+def find_latest_checkpoint():
+    ckpt_pattern = os.path.join(PROJECT_ROOT, "mamba_integer_step_*.pt")
+    ckpts = glob.glob(ckpt_pattern)
+    if not ckpts:
+        final = os.path.join(PROJECT_ROOT, "mamba_integer_final.pt")
+        return final if os.path.exists(final) else None
+    ckpts_with_step = []
+    for ckpt in ckpts:
+        try:
+            step = int(os.path.basename(ckpt).replace(".pt", "").split("_")[-1])
+            ckpts_with_step.append((step, ckpt))
+        except:
+            pass
+    if not ckpts_with_step:
+        return None
+    ckpts_with_step.sort(reverse=True)
+    return ckpts_with_step[0][1]
+
+CHECKPOINT_PATH = find_latest_checkpoint()
+OUTPUT_BIN = "mamba_integer_export.bin"
 
 def export_model():
     print(f"--- Exporting Dyadic Mamba to Binary ({OUTPUT_BIN}) ---")

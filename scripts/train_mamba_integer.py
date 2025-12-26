@@ -9,9 +9,8 @@ import time
 import numpy as np
 import glob
 
-# Add src directory to path
+# Add src directory to path (no external dependencies)
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
-sys.path.insert(0, "/home/jayantlohia16/experiment/gemma-intelligent/conv/src/bitnet-odp/src")
 
 from mamba_integer_model import MambaIntegerModel
 

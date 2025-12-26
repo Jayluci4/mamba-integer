@@ -84,24 +84,31 @@ class RustTokenizer:
         return out_bytes.decode('utf-8', errors='replace')
 
 def get_rust_tokenizer(merges_path=None):
-    # Adjust path to find lib relative to this file or current dir
-    # Try current dir first, then ../cuda_kernels/
+    """Find and load the Rust BPE tokenizer library.
+
+    Searches for librustbpe.so in multiple locations relative to this file.
+    """
     base = os.path.dirname(os.path.abspath(__file__))
-    lib_path = os.path.join(base, "cuda_kernels/librustbpe.so")
-    
-    if not os.path.exists(lib_path):
-        # Try alternative path
-        lib_path = os.path.join(base, "../cuda_kernels/librustbpe.so")
-    
-    if not os.path.exists(lib_path):
-        # Try rust_tokenizer target directory
-        lib_path = os.path.join(base, "rust_tokenizer/target/release/librustbpe.so")
-    
-    if not os.path.exists(lib_path):
-        # Fallback to experiment path if running from weird location
-        lib_path = "/home/jayantlohia16/experiment/mamba-integer/src/cuda_kernels/librustbpe.so"
-    
-    if not os.path.exists(lib_path):
-        raise FileNotFoundError(f"Could not find librustbpe.so. Tried: {lib_path}")
-        
+
+    # Search paths in order of preference
+    search_paths = [
+        os.path.join(base, "cuda_kernels/librustbpe.so"),
+        os.path.join(base, "../cuda_kernels/librustbpe.so"),
+        os.path.join(base, "rust_tokenizer/target/release/librustbpe.so"),
+        os.path.join(base, "../src/rust_tokenizer/target/release/librustbpe.so"),
+    ]
+
+    lib_path = None
+    for path in search_paths:
+        if os.path.exists(path):
+            lib_path = path
+            break
+
+    if lib_path is None:
+        raise FileNotFoundError(
+            f"Could not find librustbpe.so. Searched:\n"
+            + "\n".join(f"  - {p}" for p in search_paths)
+            + "\n\nBuild with: cd src/rust_tokenizer && cargo build --release"
+        )
+
     return RustTokenizer(lib_path, merges_path)
