@@ -16,6 +16,17 @@
     "d_head": 64,
     "use_ssd": true
   },
+  "training": {
+    "seq_len": 512,
+    "batch_size": 2,
+    "gradient_accumulation_steps": 32,
+    "total_steps": 15000,
+    "learning_rate": 1e-3,
+    "decay_lr": 5e-3,
+    "weight_decay": 0.01,
+    "grad_clip": 1.0,
+    "num_workers": 0
+  },
   "rms_norm_eps": 1e-05,
   "use_bitshift_norm": true,
   "use_square_activation": true,

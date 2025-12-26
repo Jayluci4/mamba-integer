@@ -173,18 +173,33 @@ def train():
     # model = torch.compile(model, mode='default')
     print("Running without torch.compile (custom Triton kernels active)")
 
+    # Training hyperparameters from config
+    train_cfg = config.get('training', {})
+    learning_rate = train_cfg.get('learning_rate', 1e-3)
+    decay_lr = train_cfg.get('decay_lr', 5e-3)
+    weight_decay = train_cfg.get('weight_decay', 0.01)
+    total_opt_steps = train_cfg.get('total_steps', 15000)
+    seq_len = train_cfg.get('seq_len', 512)
+    batch_size = train_cfg.get('batch_size', 2)
+    gradient_accumulation_steps = train_cfg.get('gradient_accumulation_steps', 32)
+    num_workers = train_cfg.get('num_workers', 0)
+    grad_clip = train_cfg.get('grad_clip', 1.0)
+
+    print(f"Training config: seq_len={seq_len}, batch_size={batch_size}, grad_accum={gradient_accumulation_steps}")
+    print(f"  LR: other={learning_rate}, decay={decay_lr}, weight_decay={weight_decay}")
+    print(f"  Total steps: {total_opt_steps}, grad_clip={grad_clip}")
+
     # P1 FIX: Increased learning rate for other_params from 5e-4 to 1e-3
     # SSM models (Mamba, minGRU) typically need higher LR than transformers
     # decay_params at 5x (was 10x) relative to other_params
     optimizer = optim.AdamW([
-        {'params': decay_params, 'lr': 5e-3, 'weight_decay': 0.0},
-        {'params': other_params, 'lr': 1e-3, 'weight_decay': 0.01}
+        {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
+        {'params': other_params, 'lr': learning_rate, 'weight_decay': weight_decay}
     ])
 
-    total_opt_steps = 15000
     # P1 FIX: Updated max_lr to match new base LR (1e-3 for other_params)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=[5e-3, 1e-3], total_steps=total_opt_steps, pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
+        optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps, pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
     )
 
     # --- Auto-Resume Logic (with validation) ---
@@ -241,13 +256,13 @@ def train():
                     except Exception as e:
                         print(f"ERROR loading optimizer/scheduler: {e}")
                         print("Creating fresh optimizer/scheduler and warming up...")
-                        # Recreate optimizer and scheduler with P1 FIX learning rates
+                        # Recreate optimizer and scheduler using config values
                         optimizer = optim.AdamW([
-                            {'params': decay_params, 'lr': 5e-3, 'weight_decay': 0.0},
-                            {'params': other_params, 'lr': 1e-3, 'weight_decay': 0.01}
+                            {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
+                            {'params': other_params, 'lr': learning_rate, 'weight_decay': weight_decay}
                         ])
                         scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, max_lr=[5e-3, 1e-3], total_steps=total_opt_steps,
+                            optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps,
                             pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
                         )
                         # Fast-forward scheduler
@@ -287,10 +302,9 @@ def train():
 
     # 3. Data
     bin_path = os.path.join(os.path.dirname(__file__), "tinystories_train.bin")
-    dataset = BinaryDataset(bin_path, seq_len=512)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=False, num_workers=0, pin_memory=True)
+    dataset = BinaryDataset(bin_path, seq_len=seq_len)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
-    gradient_accumulation_steps = 32
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
     # P0 FIX: Warmup Triton kernels to prevent mid-training hangs
@@ -328,7 +342,7 @@ def train():
             step_loss += loss.detach()
 
         # Gradient clipping
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
         # P2 FIX: Gradient health monitoring - check for NaN/Inf before optimizer step
         grad_healthy = True
