@@ -206,19 +206,42 @@ log_info "Phase 4: Building Rust tokenizer..."
 
 if [ -d "$RUST_TOKENIZER_DIR" ]; then
     cd "$RUST_TOKENIZER_DIR"
-    cargo build --release
 
-    # Copy library to cuda_kernels for easy access
+    # Verify cargo is available
+    if ! command -v cargo &> /dev/null; then
+        log_error "cargo not found. Please install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+        exit 1
+    fi
+
+    # Build with error checking
+    if ! cargo build --release; then
+        log_error "Rust tokenizer build failed"
+        exit 1
+    fi
+
+    # Ensure target directory exists
+    mkdir -p "$CUDA_KERNELS_DIR"
+
+    # Copy library with verification
     if [ -f "target/release/librustbpe.so" ]; then
-        cp target/release/librustbpe.so "$CUDA_KERNELS_DIR/" 2>/dev/null || true
-        log_success "Rust tokenizer built and copied"
+        cp target/release/librustbpe.so "$CUDA_KERNELS_DIR/"
+        if [ -f "$CUDA_KERNELS_DIR/librustbpe.so" ]; then
+            log_success "Rust tokenizer built and copied to $CUDA_KERNELS_DIR/"
+        else
+            log_error "Failed to copy librustbpe.so to $CUDA_KERNELS_DIR/"
+            exit 1
+        fi
     elif [ -f "target/release/librustbpe.dylib" ]; then
-        cp target/release/librustbpe.dylib "$CUDA_KERNELS_DIR/" 2>/dev/null || true
+        cp target/release/librustbpe.dylib "$CUDA_KERNELS_DIR/"
         log_success "Rust tokenizer built (macOS)"
+    else
+        log_error "librustbpe library not found after build. Check Cargo.toml crate-type."
+        exit 1
     fi
     cd "$REPO_ROOT"
 else
-    log_warn "Rust tokenizer directory not found, skipping..."
+    log_error "Rust tokenizer directory not found at $RUST_TOKENIZER_DIR"
+    exit 1
 fi
 
 # =============================================================================

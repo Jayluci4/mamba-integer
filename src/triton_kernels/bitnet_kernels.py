@@ -10,7 +10,6 @@ This enables ZK-ML compatibility and edge deployment.
 import torch
 import triton
 import triton.language as tl
-from triton.language import math as tl_math  # For rint in quantization (Triton 2.3+)
 
 # --- Forward Kernels ---
 
@@ -37,7 +36,9 @@ def quantize_activations_kernel(
     tl.store(scale_ptr + pid, scale)
     
     q_factor = 127.0 / scale
-    x_quant = tl_math.rint(x * q_factor)
+    x_scaled = x * q_factor
+    # Round to nearest integer (Triton 3.x compatible)
+    x_quant = tl.where(x_scaled >= 0, tl.floor(x_scaled + 0.5), tl.ceil(x_scaled - 0.5))
     # tl.clamp not available in Triton 2.3, use min/max instead
     x_quant = tl.minimum(tl.maximum(x_quant, -127.0), 127.0)
     
