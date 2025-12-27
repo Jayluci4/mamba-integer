@@ -1,0 +1,27 @@
+{
+    "d_model": 256,
+    "n_layer": 4,
+    "vocab_size": 4096,
+    "ssm_cfg": {
+        "d_state": 32,
+        "n_heads": 8,
+        "d_head": 32,
+        "use_ssd": true,
+        "use_surprise_gate": true,
+        "chunk_size": 32
+    },
+    "training": {
+        "seq_len": 128,
+        "batch_size": 4,
+        "gradient_accumulation_steps": 1,
+        "total_steps": 100,
+        "learning_rate": 5e-4,
+        "warmup_steps": 10,
+        "weight_decay": 0.1,
+        "use_amp": false,
+        "log_interval": 10,
+        "save_interval": 50,
+        "log_surprise": true
+    },
+    "model_name": "mamba_integer_v2_small"
+}
