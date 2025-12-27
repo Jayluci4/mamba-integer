@@ -27,8 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 
-# V2 imports
-from v2 import MambaIntegerBlockV2Surprise
+# V2 imports - use FAST chunked version
+from v2 import MambaIntegerBlockV2Chunked as MambaIntegerBlockV2Surprise
 
 
 class MambaIntegerModelV2(nn.Module):
