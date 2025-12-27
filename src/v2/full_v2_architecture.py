@@ -27,10 +27,8 @@ sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src')
 from triton_kernels.ssd_multihead import build_causal_decay_matrix_multihead
 
 # Import BitLinear for integer-only operations
-# Note: BitLinear has Triton compatibility issues in some environments
-# We disable it by default and use nn.Linear for prototyping
-# Set USE_BITLINEAR = True to enable after fixing Triton kernels
-USE_BITLINEAR = False  # Disabled due to Triton rint compatibility
+# Uses ternary weights {-1, 0, 1} for addition-only matmul
+USE_BITLINEAR = True  # Enabled after fixing Triton libdevice.rint
 
 if USE_BITLINEAR:
     try:
@@ -38,11 +36,9 @@ if USE_BITLINEAR:
         HAS_BITLINEAR = True
     except ImportError:
         HAS_BITLINEAR = False
+        BitLinear = nn.Linear
 else:
     HAS_BITLINEAR = False
-
-# Fallback to nn.Linear
-if not HAS_BITLINEAR:
     BitLinear = nn.Linear
 
 
