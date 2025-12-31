@@ -12,12 +12,59 @@ Mamba-Integer is a production-grade implementation of a purely integer-native St
 *   **BitShift Norm:** Power-of-2 normalization with learnable integer scalar. Replaces standard RMSNorm with shift-add logic.
 *   **ZK-Optimal Design:** 16x reduction in circuit depth (LogRows 17) and 100% elimination of lookup tables.
 
-## 📊 Performance (L4 GPU)
+## 📊 Performance
 
-| Version | Implementation | Throughput (Step Time) | Relative Speed |
+### A100 80GB (Current)
+
+| Version | Implementation | Step Time | Throughput | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| V2 (baseline) | Naive SSD backward | 6.47s | 22.8k tok/s | 1.0x |
+| **V2 (optimized)** | **Memory-efficient SSD backward** | **3.0s** | **53.4k tok/s** | **2.3x** |
+
+### L4 GPU (Legacy)
+
+| Version | Implementation | Step Time | Speedup |
 | :--- | :--- | :--- | :--- |
-| **V1** | Standard PyTorch | ~50.0s | 1.0x |
-| **V2** | **Fused Triton + Inductor** | **~6.0s** | **8.3x - 10x** |
+| V1 | Standard PyTorch | ~50.0s | 1.0x |
+| V2 | Fused Triton + Inductor | ~6.0s | 8.3x |
+
+## 🔧 SSD Backward Pass Optimization
+
+The key bottleneck in Mamba-2 SSD training is the backward pass, which was 20x slower than forward (86% of training time). We optimized this by avoiding materialization of the full hidden state tensor.
+
+### The Problem
+
+Original backward computed the hidden state `h` explicitly:
+```python
+# h shape: [B, n_heads, n_chunks, chunk_size, d_state, d_head]
+# For B=10, n_heads=24, n_chunks=16, cs=64, d_state=64, d_head=64
+# This is 10 * 24 * 16 * 64 * 64 * 64 * 4 bytes = 10GB per forward pass!
+h = einsum('bhnij,bhnjs,bhnjd->bhnisd', L, B, X)
+grad_C = einsum('bhnid,bhnisd->bhnis', grad_Y, h)
+```
+
+### The Solution
+
+Use the SSD identity `Y = (L * CB) @ X` where `CB = C @ B.T` has shape `[cs, cs]` instead of `[d_state, d_head]`:
+
+```python
+# CB shape: [B, n_heads, n_chunks, cs, cs] = 10 * 24 * 16 * 64 * 64 * 4 = 157MB
+CB = einsum('bhnis,bhnjs->bhnij', C, B)
+L_CB = L * CB
+grad_CB = grad_L_CB * L
+grad_C = einsum('bhnij,bhnjs->bhnis', grad_CB, B)  # Direct, no h needed
+```
+
+### Results
+
+| Metric | Before | After | Improvement |
+| :--- | :--- | :--- | :--- |
+| SSD fwd+bwd kernel | 52ms | 9ms | 5.6x faster |
+| Backward pass | 1548ms | 518ms | 3.0x faster |
+| Training step | 1794ms | 767ms | 2.3x faster |
+| Peak memory | 58.7GB | 44.6GB | -14GB |
+
+See `src/triton_kernels/ssd_multihead.py` for the implementation.
 
 ## 📂 Repository Structure
 
