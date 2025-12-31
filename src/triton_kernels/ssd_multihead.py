@@ -258,189 +258,117 @@ class SSDMultiheadFunction(torch.autograd.Function):
             C: [B, L, n_heads, d_state] output projection
         """
         Y = ssd_multihead_forward(X, A, B, C, chunk_size)
-        ctx.save_for_backward(X, A, B, C, Y)
+        ctx.save_for_backward(X, A, B, C)
         ctx.chunk_size = chunk_size
         return Y
 
     @staticmethod
     def backward(ctx, grad_Y):
-        """Backward pass using reverse-mode SSD."""
-        X, A, B, C, Y = ctx.saved_tensors
+        """Memory-efficient backward pass - avoids materializing full h tensor."""
+        X, A, B, C = ctx.saved_tensors
         chunk_size = ctx.chunk_size
 
         batch, seqlen, n_heads, d_head = X.shape
         d_state = B.shape[-1]
         device = X.device
-        dtype = X.dtype
+        orig_dtype = X.dtype
 
-        # For the backward pass of SSD, we use the fact that:
-        # The backward of a linear recurrence is also a linear recurrence running in reverse
-
-        # Simplified gradient computation (accurate but not optimized)
-        # Will use autograd for correctness, optimize later with Triton
-
-        # grad_X: contribution from Y = C @ h, h = f(X, A, B)
-        # grad_A: contribution from decay affecting all positions
-        # grad_B: contribution from h accumulation
-        # grad_C: contribution from output projection
-
-        # Use numerical differentiation fallback for now
-        # This is slow but correct - will optimize with Triton kernel
-
-        eps = 1e-4
-
-        # grad_C (simplest): Y[i] = C[i] @ h[i], so grad_C[i] = grad_Y[i] @ h[i].T
-        # But we don't have h explicitly. Recompute via SSD.
-
-        # For now, use simple chain rule approximation
-        # grad_X = grad_Y (simplified, will improve)
-        grad_X = grad_Y.clone()
-
-        # grad_A: affects decay throughout
-        # Approximate: grad_A[t] = grad_Y[t] * (partial Y / partial A[t])
-        grad_A = torch.zeros_like(A)
-
-        # grad_B and grad_C from output equation
-        # Y = C @ h, h involves B
-        grad_B = torch.zeros_like(B)
-        grad_C = torch.zeros_like(C)
-
-        # Better approximation: use the structure of SSD
-        # grad_h = C.T @ grad_Y (from Y = C @ h)
-        # grad_C = grad_Y @ h.T
-        # grad_X from h = L @ (B.T @ X)
-        # grad_B from same
-        # grad_A from L matrix dependency
-
-        # Compute h for gradients (recompute forward pass)
-        # This is memory-intensive but correct
+        # Cast to float32 for stability
+        X = X.float()
+        A = A.float()
+        B = B.float()
+        C = C.float()
+        grad_Y = grad_Y.float()
 
         # Pad sequences
         orig_seqlen = seqlen
         if seqlen % chunk_size != 0:
             pad_len = chunk_size - (seqlen % chunk_size)
-            X_pad = F.pad(X, (0, 0, 0, 0, 0, pad_len), value=0.0)
-            A_pad = F.pad(A, (0, 0, 0, pad_len), value=0.0)
-            B_pad = F.pad(B, (0, 0, 0, 0, 0, pad_len), value=0.0)
-            C_pad = F.pad(C, (0, 0, 0, 0, 0, pad_len), value=0.0)
-            grad_Y_pad = F.pad(grad_Y, (0, 0, 0, 0, 0, pad_len), value=0.0)
-            seqlen = X_pad.shape[1]
-        else:
-            X_pad, A_pad, B_pad, C_pad, grad_Y_pad = X, A, B, C, grad_Y
+            X = F.pad(X, (0, 0, 0, 0, 0, pad_len), value=0.0)
+            A = F.pad(A, (0, 0, 0, pad_len), value=0.0)
+            B = F.pad(B, (0, 0, 0, 0, 0, pad_len), value=0.0)
+            C = F.pad(C, (0, 0, 0, 0, 0, pad_len), value=0.0)
+            grad_Y = F.pad(grad_Y, (0, 0, 0, 0, 0, pad_len), value=0.0)
+            seqlen = X.shape[1]
 
         n_chunks = seqlen // chunk_size
+        cs = chunk_size
 
-        # Reshape to chunks
-        X_chunks = X_pad.view(batch, n_chunks, chunk_size, n_heads, d_head)
-        A_chunks = A_pad.view(batch, n_chunks, chunk_size, n_heads)
-        B_chunks = B_pad.view(batch, n_chunks, chunk_size, n_heads, d_state)
-        C_chunks = C_pad.view(batch, n_chunks, chunk_size, n_heads, d_state)
-        grad_Y_chunks = grad_Y_pad.view(batch, n_chunks, chunk_size, n_heads, d_head)
+        # Reshape to [B, n_heads, n_chunks, cs, ...]
+        X_t = X.view(batch, n_chunks, cs, n_heads, d_head).permute(0, 3, 1, 2, 4)
+        A_t = A.view(batch, n_chunks, cs, n_heads).permute(0, 3, 1, 2)
+        B_t = B.view(batch, n_chunks, cs, n_heads, d_state).permute(0, 3, 1, 2, 4)
+        C_t = C.view(batch, n_chunks, cs, n_heads, d_state).permute(0, 3, 1, 2, 4)
+        grad_Y_t = grad_Y.view(batch, n_chunks, cs, n_heads, d_head).permute(0, 3, 1, 2, 4)
 
-        # Transpose
-        X_t = X_chunks.permute(0, 3, 1, 2, 4)  # [B, n_heads, n_chunks, cs, d_head]
-        A_t = A_chunks.permute(0, 3, 1, 2)  # [B, n_heads, n_chunks, cs]
-        B_t = B_chunks.permute(0, 3, 1, 2, 4)  # [B, n_heads, n_chunks, cs, d_state]
-        C_t = C_chunks.permute(0, 3, 1, 2, 4)  # [B, n_heads, n_chunks, cs, d_state]
-        grad_Y_t = grad_Y_chunks.permute(0, 3, 1, 2, 4)  # [B, n_heads, n_chunks, cs, d_head]
-
-        # Build L matrix
+        # Build L matrix for all chunks
         A_cumsum = torch.cumsum(A_t, dim=-1)
         L = build_causal_decay_matrix_multihead(A_cumsum)
 
-        # grad_C: Y = (L * CB) @ X, CB = C @ B.T
-        # grad_C contribution from einsum('bhnij,bhnjd->bhnid', L_CB, X_t)
-        # where L_CB = L * (C @ B.T)
-        CB = torch.einsum('bhnid,bhnjd->bhnij', C_t, B_t)
+        # ===== MEMORY-EFFICIENT GRADIENT COMPUTATION =====
+        # Instead of computing full h tensor, use the identity:
+        # Y = (L * (C @ B.T)) @ X
+        # This lets us compute gradients without materializing h[d_state, d_head]
+
+        # CB = C @ B.T: [B, n_heads, n_chunks, cs, cs]
+        CB = torch.einsum('bhnis,bhnjs->bhnij', C_t, B_t)
         L_CB = L * CB
 
-        # grad_C[i] comes from L_CB[i,j] * X[j] terms
-        # d/dC[i,s] of sum_j L[i,j] * C[i,s] * B[j,s] * X[j,d]
-        # = sum_j L[i,j] * B[j,s] * X[j,d]
-        # Weighted by grad_Y[i,d]
-        # grad_C = einsum('bhnid,bhnij,bhnjd->bhnis', grad_Y_t, L, X_t @ B_t.T doesn't work)
+        # grad w.r.t. L_CB from Y = L_CB @ X
+        # grad_L_CB = grad_Y @ X.T
+        grad_L_CB = torch.einsum('bhnid,bhnjd->bhnij', grad_Y_t, X_t)
 
-        # Simpler: grad_C[i,s] = grad_Y[i] @ (sum_j L[i,j] * B[j,s] @ X[j])
-        # Let H[i,s,d] = sum_j L[i,j] * B[j,s] * X[j,d]
-        # grad_C[i,s] = sum_d grad_Y[i,d] * sum_j L[i,j] * X[j,d] * B[j,s]
+        # grad_X from Y = L_CB @ X
+        # grad_X = L_CB.T @ grad_Y
+        grad_X_t = torch.einsum('bhnij,bhnid->bhnjd', L_CB, grad_Y_t)
 
-        # H = L @ (B * X summed over d?) - this is getting complex
-        # Use simpler formulation:
-        # grad_C = grad_Y @ h.T where h is the hidden state
-        # But h has shape [d_state, d_head] at each position
+        # grad w.r.t. L and CB
+        grad_L = grad_L_CB * CB
+        grad_CB = grad_L_CB * L
 
-        # Compute h explicitly for gradient
-        # h[i] = sum_{j<=i} L[i,j] * outer(B[j], X[j])
-        # h[i,s,d] = sum_{j<=i} L[i,j] * B[j,s] * X[j,d]
+        # grad_C from CB = C @ B.T
+        # grad_C = grad_CB @ B
+        grad_C_t = torch.einsum('bhnij,bhnjs->bhnis', grad_CB, B_t)
 
-        # For memory efficiency, compute per-chunk
-        grad_C_chunks = torch.zeros_like(C_t)
-        grad_B_chunks = torch.zeros_like(B_t)
-        grad_X_chunks = torch.zeros_like(X_t)
-        grad_A_chunks = torch.zeros_like(A_t)
+        # grad_B from CB = C @ B.T (note: CB[i,j] = sum_s C[i,s] * B[j,s])
+        # grad_B[j,s] = sum_i grad_CB[i,j] * C[i,s]
+        grad_B_t = torch.einsum('bhnij,bhnis->bhnjs', grad_CB, C_t)
 
+        # grad_A from L[i,j] = exp(A_cumsum[i] - A_cumsum[j])
+        M = grad_L * L
+
+        # Vectorized grad_A computation
+        M_cumsum_j = torch.cumsum(M, dim=-1)
+        M_suffix = torch.flip(torch.cumsum(torch.flip(M_cumsum_j, dims=[-2]), dim=-2), dims=[-2])
+
+        grad_A_intra = torch.zeros(batch, n_heads, n_chunks, cs, device=device, dtype=torch.float32)
+        diag_indices = torch.arange(1, cs, device=device)
+        grad_A_intra[:, :, :, 1:] = M_suffix[:, :, :, diag_indices, diag_indices - 1]
+
+        # ===== INTER-CHUNK GRADIENT =====
+        decay_from_start = torch.exp(A_cumsum)
+        decay_chunk = torch.exp(A_t.sum(dim=-1))
+        decay_to_end = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+        h_chunk_final = torch.einsum('bhnc,bhncs,bhncd->bhnsd', decay_to_end, B_t, X_t)
+
+        # Sequential carry (only n_chunks iterations)
+        h_inter = torch.zeros(batch, n_heads, n_chunks, d_state, d_head, device=device, dtype=torch.float32)
+        carry = torch.zeros(batch, n_heads, d_state, d_head, device=device, dtype=torch.float32)
         for c in range(n_chunks):
-            # Get chunk data
-            L_c = L[:, :, c]  # [B, n_heads, cs, cs]
-            X_c = X_t[:, :, c]  # [B, n_heads, cs, d_head]
-            B_c = B_t[:, :, c]  # [B, n_heads, cs, d_state]
-            C_c = C_t[:, :, c]  # [B, n_heads, cs, d_state]
-            grad_Y_c = grad_Y_t[:, :, c]  # [B, n_heads, cs, d_head]
+            h_inter[:, :, c] = carry
+            carry = decay_chunk[:, :, c:c+1, None] * carry + h_chunk_final[:, :, c]
 
-            # h[i,s,d] = sum_j L[i,j] * B[j,s] * X[j,d]
-            # = einsum('bnij,bnjs,bnjd->bnisd', L_c, B_c, X_c)
-            h_c = torch.einsum('bhij,bhjs,bhjd->bhisd', L_c, B_c, X_c)
-            # h_c: [B, n_heads, cs, d_state, d_head]
+        grad_decay_from_start = torch.einsum('bhnip,bhnis,bhnsp->bhni', grad_Y_t, C_t, h_inter)
+        grad_A_cumsum_inter = grad_decay_from_start * decay_from_start
+        grad_A_inter = torch.flip(torch.cumsum(torch.flip(grad_A_cumsum_inter, dims=[-1]), dim=-1), dims=[-1])
 
-            # grad_C: Y[i,d] = sum_s C[i,s] * h[i,s,d]
-            # grad_C[i,s] = sum_d grad_Y[i,d] * h[i,s,d]
-            grad_C_c = torch.einsum('bhid,bhisd->bhis', grad_Y_c, h_c)
-            grad_C_chunks[:, :, c] = grad_C_c
+        grad_A_t = grad_A_intra + grad_A_inter
 
-            # grad_h from Y = C @ h
-            # grad_h[i,s,d] = C[i,s] * grad_Y[i,d]
-            grad_h_c = torch.einsum('bhis,bhid->bhisd', C_c, grad_Y_c)
-            # grad_h_c: [B, n_heads, cs, d_state, d_head]
-
-            # grad_B from h[i,s,d] = sum_j L[i,j] * B[j,s] * X[j,d]
-            # grad_B[j,s] = sum_{i>=j} sum_d L[i,j] * X[j,d] * grad_h[i,s,d]
-            # = sum_d X[j,d] * sum_i L[i,j] * grad_h[i,s,d]
-            # = sum_d X[j,d] * einsum('bhij,bhisd->bhjsd', L_c.transpose(-1,-2), grad_h_c)[:,:,j,s,d]
-            # But L is lower triangular, so L.T is upper triangular
-            # sum_i L[i,j] = sum_{i>=j} L[i,j]
-
-            # Simpler: grad_B[j,s] = sum_{i,d} L[i,j] * X[j,d] * grad_h[i,s,d]
-            # But X[j,d] doesn't depend on i, so:
-            # grad_B[j,s] = sum_d X[j,d] * sum_i L[i,j] * grad_h[i,s,d]
-            L_sum_over_i = L_c.sum(dim=-2)  # [B, n_heads, cs] (sum over i for each j)
-            # Actually need: sum_i L[i,j] * grad_h[i,s,d] for each j,s,d
-            # = einsum('bhij,bhisd->bhjsd', L_c, grad_h_c) but with sum over i
-            # L_c is [B, h, cs_i, cs_j], grad_h_c is [B, h, cs_i, s, d]
-            # Want: for each j, sum over i: L[i,j] * grad_h[i]
-            # = einsum('bhij,bhisd->bhjsd', L_c.transpose(-1,-2), grad_h_c)? No, wrong indices
-
-            # Let's be explicit: L_c[b,h,i,j] * grad_h_c[b,h,i,s,d] summed over i -> result[b,h,j,s,d]
-            grad_h_weighted = torch.einsum('bhij,bhisd->bhjsd', L_c, grad_h_c)
-            # Now grad_B[j,s] = sum_d X[j,d] * grad_h_weighted[j,s,d]
-            grad_B_c = torch.einsum('bhjd,bhjsd->bhjs', X_c, grad_h_weighted)
-            grad_B_chunks[:, :, c] = grad_B_c
-
-            # grad_X from h[i,s,d] = sum_j L[i,j] * B[j,s] * X[j,d]
-            # grad_X[j,d] = sum_{i>=j} sum_s L[i,j] * B[j,s] * grad_h[i,s,d]
-            # = sum_s B[j,s] * sum_i L[i,j] * grad_h[i,s,d]
-            # = einsum('bhjs,bhjsd->bhjd', B_c, grad_h_weighted)
-            grad_X_c = torch.einsum('bhjs,bhjsd->bhjd', B_c, grad_h_weighted)
-            grad_X_chunks[:, :, c] = grad_X_c
-
-            # grad_A from L[i,j] = exp(A_cumsum[i] - A_cumsum[j])
-            # This is complex - for now approximate with zeros (decay is less critical)
-            # TODO: Implement proper grad_A
-
-        # Permute back
-        grad_C_out = grad_C_chunks.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_state)
-        grad_B_out = grad_B_chunks.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_state)
-        grad_X_out = grad_X_chunks.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_head)
-        grad_A_out = grad_A_chunks.permute(0, 2, 3, 1).reshape(batch, seqlen, n_heads)
+        # ===== RESHAPE AND RETURN =====
+        grad_X_out = grad_X_t.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_head)
+        grad_A_out = grad_A_t.permute(0, 2, 3, 1).reshape(batch, seqlen, n_heads)
+        grad_B_out = grad_B_t.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_state)
+        grad_C_out = grad_C_t.permute(0, 2, 3, 1, 4).reshape(batch, seqlen, n_heads, d_state)
 
         # Remove padding
         grad_X_out = grad_X_out[:, :orig_seqlen]
@@ -448,7 +376,9 @@ class SSDMultiheadFunction(torch.autograd.Function):
         grad_B_out = grad_B_out[:, :orig_seqlen]
         grad_C_out = grad_C_out[:, :orig_seqlen]
 
-        return grad_X_out, grad_A_out, grad_B_out, grad_C_out, None
+        # Cast back to original dtype
+        return (grad_X_out.to(orig_dtype), grad_A_out.to(orig_dtype),
+                grad_B_out.to(orig_dtype), grad_C_out.to(orig_dtype), None)
 
 
 def ssd_multihead(X, A, B, C, chunk_size=64):

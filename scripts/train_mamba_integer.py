@@ -3,7 +3,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 import json
 import time
 import numpy as np
@@ -13,11 +13,188 @@ import glob
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
 from mamba_integer_model import MambaIntegerModel
+from rust_tokenizer import get_rust_tokenizer
 
 # --- Config ---
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
+
+# Use streaming by default (no pre-download needed)
+USE_STREAMING = True
+
+# --- Dataset Configurations ---
+# Research-backed mix: 60% general, 25% code, 15% math
+DATASET_MIX = {
+    # Tier 1: High-quality general text (60%)
+    "fineweb_edu": {
+        "weight": 0.60,
+        "path": "HuggingFaceFW/fineweb-edu",
+        "name": "sample-10BT",
+        "text_field": "text",
+        "description": "Educational web content - SOTA filtered (10B tokens)"
+    },
+
+    # Tier 2: Code - tiny-codes (25%) - fast, high quality snippets
+    "tiny_codes": {
+        "weight": 0.25,
+        "path": "nampdn-ai/tiny-codes",
+        "name": None,
+        "text_field": "prompt",  # or "response" for the code itself
+        "description": "1.6M high-quality code snippets (Textbooks Are All You Need)"
+    },
+
+    # Tier 3: Math and Reasoning (15%)
+    "openwebmath": {
+        "weight": 0.15,
+        "path": "open-web-math/open-web-math",
+        "name": None,
+        "text_field": "text",
+        "description": "Mathematical web content (14.7B tokens)"
+    }
+}
+
+# Set to False to use only FineWeb-Edu (faster, less diverse)
+USE_MIXED_DATASETS = True
+
+# HuggingFace token for gated datasets (e.g., StarCoder)
+# Set HF_TOKEN environment variable if needed
+HF_TOKEN = os.environ.get("HF_TOKEN", None)
+
+
+# --- Mixed Streaming Dataset ---
+class MixedStreamingDataset(IterableDataset):
+    """Stream from multiple datasets with weighted sampling."""
+
+    def __init__(self, seq_len, tokenizer, dataset_mix=None):
+        self.seq_len = seq_len
+        self.tokenizer = tokenizer
+        self.dataset_mix = dataset_mix or DATASET_MIX
+
+        # Normalize weights
+        total_weight = sum(cfg["weight"] for cfg in self.dataset_mix.values())
+        self.weights = {k: cfg["weight"] / total_weight for k, cfg in self.dataset_mix.items()}
+
+        # Per-dataset buffers
+        self.buffers = {name: [] for name in self.dataset_mix}
+        self.iterators = {}
+        self.exhausted = set()
+
+        print(f"Mixed dataset initialized with {len(self.dataset_mix)} sources:")
+        for name, cfg in self.dataset_mix.items():
+            print(f"  - {name}: {self.weights[name]*100:.0f}% ({cfg['description']})")
+
+    def _get_iterator(self, name):
+        """Lazily initialize dataset iterator."""
+        if name not in self.iterators and name not in self.exhausted:
+            from datasets import load_dataset
+            cfg = self.dataset_mix[name]
+            try:
+                if cfg["name"]:
+                    ds = load_dataset(cfg["path"], name=cfg["name"], split="train", streaming=True, token=HF_TOKEN)
+                else:
+                    ds = load_dataset(cfg["path"], split="train", streaming=True, token=HF_TOKEN)
+                self.iterators[name] = iter(ds)
+                print(f"  Loaded {name} successfully")
+            except Exception as e:
+                print(f"  Warning: Failed to load {name}: {e}")
+                self.exhausted.add(name)
+                return None
+        return self.iterators.get(name)
+
+    def _fill_buffer(self, name, min_tokens=None):
+        """Fill buffer for a specific dataset."""
+        min_tokens = min_tokens or (self.seq_len + 1)
+        cfg = self.dataset_mix[name]
+        text_field = cfg["text_field"]
+
+        iterator = self._get_iterator(name)
+        if iterator is None:
+            return False
+
+        try:
+            while len(self.buffers[name]) < min_tokens:
+                doc = next(iterator)
+                # Handle datasets with multiple text fields (e.g., tiny-codes has prompt+response)
+                if text_field == "prompt" and "response" in doc:
+                    text = doc.get("prompt", "") + "\n" + doc.get("response", "")
+                else:
+                    text = doc.get(text_field, "")
+                if text:
+                    tokens = self.tokenizer.encode(text)
+                    self.buffers[name].extend(tokens)
+            return True
+        except StopIteration:
+            self.exhausted.add(name)
+            if name in self.iterators:
+                del self.iterators[name]
+            return len(self.buffers[name]) >= min_tokens
+
+    def _sample_dataset(self):
+        """Sample a dataset based on weights, excluding exhausted ones."""
+        available = [n for n in self.weights if n not in self.exhausted or self.buffers[n]]
+        if not available:
+            return None
+
+        # Renormalize weights for available datasets
+        total = sum(self.weights[n] for n in available)
+        probs = [self.weights[n] / total for n in available]
+
+        return np.random.choice(available, p=probs)
+
+    def __iter__(self):
+        while True:
+            # Sample which dataset to draw from
+            name = self._sample_dataset()
+            if name is None:
+                print("All datasets exhausted!")
+                return
+
+            # Ensure buffer has enough tokens
+            if len(self.buffers[name]) < self.seq_len + 1:
+                if not self._fill_buffer(name):
+                    continue  # Try another dataset
+
+            # Extract chunk
+            if len(self.buffers[name]) >= self.seq_len + 1:
+                chunk = self.buffers[name][:self.seq_len + 1]
+                self.buffers[name] = self.buffers[name][self.seq_len:]
+
+                x = torch.tensor(chunk[:-1], dtype=torch.long)
+                y = torch.tensor(chunk[1:], dtype=torch.long)
+                yield x, y
+
+
+# --- Single-source Streaming Dataset (fallback) ---
+class StreamingFineWebDataset(IterableDataset):
+    """Stream directly from HuggingFace - no binary file needed."""
+
+    def __init__(self, seq_len, tokenizer):
+        self.seq_len = seq_len
+        self.tokenizer = tokenizer
+        self.buffer = []
+
+    def __iter__(self):
+        from datasets import load_dataset
+
+        dataset = load_dataset(
+            "HuggingFaceFW/fineweb-edu",
+            name="sample-10BT",
+            split="train",
+            streaming=True
+        )
+
+        for doc in dataset:
+            tokens = self.tokenizer.encode(doc['text'])
+            self.buffer.extend(tokens)
+
+            while len(self.buffer) >= self.seq_len + 1:
+                chunk = self.buffer[:self.seq_len + 1]
+                self.buffer = self.buffer[self.seq_len:]
+
+                x = torch.tensor(chunk[:-1], dtype=torch.long)
+                y = torch.tensor(chunk[1:], dtype=torch.long)
+                yield x, y
 
 # --- Fast Binary Dataset ---
 class BinaryDataset(Dataset):
@@ -116,26 +293,34 @@ def warmup_triton_kernels(model, config, device='cuda'):
     sequence lengths upfront, we ensure all kernel variants are pre-compiled.
     """
     print("Warming up Triton kernels...")
+    print("AMP enabled with torch.bfloat16 (A100/H100 optimized)")
     model.eval()
+    train_seq_len = config.get('training', {}).get('seq_len', 1024)
+    warmup_seq_lens = [64, 128, 256, 512] + ([train_seq_len] if train_seq_len > 512 else [])
     with torch.no_grad():
-        for seq_len in [64, 128, 256, 512]:
+        for seq_len in warmup_seq_lens:
             x = torch.randint(0, config['vocab_size'], (2, seq_len), device=device)
             try:
-                _ = model(x)
+                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    _ = model(x)
                 torch.cuda.synchronize()
                 print(f"  Warmup pass seq_len={seq_len} complete")
             except Exception as e:
                 print(f"  Warmup warning (seq_len={seq_len}): {e}")
+    # Clear cache after warmup
+    torch.cuda.empty_cache()
 
-    # Also warm up backward pass
+    # Also warm up backward pass at training seq_len
     model.train()
-    x = torch.randint(0, config['vocab_size'], (2, 256), device=device)
-    logits = model(x)
-    loss = logits.sum()
+    x = torch.randint(0, config['vocab_size'], (2, train_seq_len), device=device)
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        logits = model(x)
+        loss = logits.sum()
     loss.backward()
     model.zero_grad()
     torch.cuda.synchronize()
-    print("Triton kernel warmup complete (forward + backward)")
+    torch.cuda.empty_cache()
+    print(f"Triton kernel warmup complete (forward + backward @ seq_len={train_seq_len})")
 
 
 def train():
@@ -177,6 +362,8 @@ def train():
     learning_rate = train_cfg.get('learning_rate', 1e-3)
     decay_lr = train_cfg.get('decay_lr', 5e-3)
     weight_decay = train_cfg.get('weight_decay', 0.01)
+    # BitNet paper: remove weight decay in second half of training for faster convergence
+    WEIGHT_DECAY_CUTOFF = 64000  # Disable weight decay after this step
     total_opt_steps = train_cfg.get('total_steps', 15000)
     seq_len = train_cfg.get('seq_len', 512)
     batch_size = train_cfg.get('batch_size', 2)
@@ -247,27 +434,24 @@ def train():
                     # Load model state
                     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
-                    # Load optimizer state with explicit error handling
-                    try:
-                        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                        print("DEBUG: Optimizer and scheduler loaded successfully")
-                    except Exception as e:
-                        print(f"ERROR loading optimizer/scheduler: {e}")
-                        print("Creating fresh optimizer/scheduler and warming up...")
-                        # Recreate optimizer and scheduler using config values
-                        optimizer = optim.AdamW([
-                            {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
-                            {'params': other_params, 'lr': learning_rate, 'weight_decay': weight_decay}
-                        ])
-                        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-                            optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps,
-                            pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
-                        )
-                        # Fast-forward scheduler
-                        for _ in range(step_num + 1):
-                            scheduler.step()
-                        print(f"Scheduler fast-forwarded to step {step_num + 1}")
+                    # FORCE NEW LR: Always recreate optimizer/scheduler with config values
+                    # This ensures LR changes in config take effect on resume
+                    # BitNet paper: remove weight decay after WEIGHT_DECAY_CUTOFF for faster convergence
+                    effective_weight_decay = 0.0 if step_num >= WEIGHT_DECAY_CUTOFF else weight_decay
+                    print(f"Creating fresh optimizer with LR from config: decay={decay_lr}, other={learning_rate}")
+                    print(f"  Weight decay: {effective_weight_decay} (cutoff at step {WEIGHT_DECAY_CUTOFF})")
+                    optimizer = optim.AdamW([
+                        {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
+                        {'params': other_params, 'lr': learning_rate, 'weight_decay': effective_weight_decay}
+                    ])
+                    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                        optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps,
+                        pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
+                    )
+                    # Fast-forward scheduler to current step
+                    for _ in range(step_num + 1):
+                        scheduler.step()
+                    print(f"Scheduler fast-forwarded to step {step_num + 1}")
 
                     start_step = checkpoint["step"] + 1
 
@@ -300,9 +484,23 @@ def train():
             start_step = 0
 
     # 3. Data
-    bin_path = os.path.join(os.path.dirname(__file__), "tinystories_train.bin")
-    dataset = BinaryDataset(bin_path, seq_len=seq_len)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    if USE_STREAMING:
+        tokenizer = get_rust_tokenizer()
+        merges_path = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
+        tokenizer.load(merges_path)
+
+        if USE_MIXED_DATASETS:
+            print("Using MIXED streaming datasets:")
+            dataset = MixedStreamingDataset(seq_len=seq_len, tokenizer=tokenizer, dataset_mix=DATASET_MIX)
+        else:
+            print("Using streaming FineWeb-Edu dataset (10B tokens available)")
+            dataset = StreamingFineWebDataset(seq_len=seq_len, tokenizer=tokenizer)
+
+        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True)
+    else:
+        bin_path = os.path.join(os.path.dirname(__file__), "tinystories_train.bin")
+        dataset = BinaryDataset(bin_path, seq_len=seq_len)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     criterion = nn.CrossEntropyLoss(ignore_index=-100)
 
@@ -334,8 +532,9 @@ def train():
                 x, y = next(data_iter)
 
             x, y = x.to(device), y.to(device)
-            logits = model(x)
-            loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                logits = model(x)
+                loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
             loss = loss / gradient_accumulation_steps
             loss.backward()
             step_loss += loss.detach()

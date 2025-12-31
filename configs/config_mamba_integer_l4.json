@@ -17,12 +17,12 @@
     "use_ssd": true
   },
   "training": {
-    "seq_len": 512,
-    "batch_size": 2,
-    "gradient_accumulation_steps": 32,
-    "total_steps": 15000,
-    "learning_rate": 1e-3,
-    "decay_lr": 5e-3,
+    "seq_len": 1024,
+    "batch_size": 10,
+    "gradient_accumulation_steps": 4,
+    "total_steps": 100000,
+    "learning_rate": 3e-4,
+    "decay_lr": 5e-4,
     "weight_decay": 0.01,
     "grad_clip": 1.0,
     "num_workers": 0
