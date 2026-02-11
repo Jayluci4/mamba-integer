@@ -34,9 +34,9 @@ USE_STREAMING = True
 # ZK-ML domain-focused mix: optimized for verifiable inference use cases
 # DeFi/smart contracts, mathematical reasoning, financial compliance, structured data
 DATASET_MIX = {
-    # Foundation: High-quality educational text (35%)
+    # Foundation: High-quality educational text (42%)
     "fineweb_edu": {
-        "weight": 0.35,
+        "weight": 0.42,
         "path": "HuggingFaceFW/fineweb-edu",
         "name": "sample-10BT",
         "text_field": "text",
@@ -52,18 +52,9 @@ DATASET_MIX = {
         "description": "514K unique Solidity contracts from Ethereum"
     },
 
-    # Code - general (8%) - programming syntax and reasoning
-    "tiny_codes": {
-        "weight": 0.08,
-        "path": "nampdn-ai/tiny-codes",
-        "name": None,
-        "text_field": "response",
-        "description": "1.6M high-quality code snippets (Textbooks Are All You Need)"
-    },
-
-    # Mathematics (15%) - provably correct reasoning
+    # Mathematics (16%) - provably correct reasoning
     "openwebmath": {
-        "weight": 0.15,
+        "weight": 0.16,
         "path": "open-web-math/open-web-math",
         "name": None,
         "text_field": "text",
@@ -363,10 +354,11 @@ def warmup_triton_kernels(model, config, device='cuda'):
     sequence lengths upfront, we ensure all kernel variants are pre-compiled.
     """
     print("Warming up Triton kernels...")
-    # FIX: Removed bfloat16 AMP — bf16 has only 8-bit mantissa which corrupts
-    # integer quantization that needs 15+ bits of precision.
-    # Training in float32 ensures integer ops work correctly.
-    print("Using float32 (integer quantization requires full precision)")
+    use_amp = config.get('training', {}).get('use_amp', False)
+    if use_amp:
+        print("Using bfloat16 mixed precision (ternary weights are exact in any float format)")
+    else:
+        print("Using float32")
     model.eval()
     train_seq_len = config.get('training', {}).get('seq_len', 1024)
     warmup_seq_lens = [64, 128, 256, 512] + ([train_seq_len] if train_seq_len > 512 else [])
@@ -383,10 +375,12 @@ def warmup_triton_kernels(model, config, device='cuda'):
     torch.cuda.empty_cache()
 
     # Also warm up backward pass at training seq_len
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
     model.train()
     x = torch.randint(0, config['vocab_size'], (2, train_seq_len), device=device)
-    logits = model(x)
-    loss = logits.sum()
+    with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+        logits = model(x)
+        loss = logits.sum()
     loss.backward()
     model.zero_grad()
     torch.cuda.synchronize()
@@ -409,7 +403,8 @@ def train():
     model = MambaIntegerModel(config).to(device)
     model.train()
     num_params = len(list(model.parameters()))
-    print(f"Model has {num_params} parameter tensors")
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Model has {num_params} parameter tensors ({total_params/1e6:.1f}M params)")
 
     # 2. Optimizer & Scheduler Setup
     decay_params = []
@@ -421,7 +416,6 @@ def train():
             other_params.append(param)
 
     print(f"Decay params: {len(decay_params)}, Other params: {len(other_params)}")
-    print("Running without torch.compile (custom Triton kernels active)")
 
     # Training hyperparameters from config
     train_cfg = config.get('training', {})
@@ -435,6 +429,23 @@ def train():
     gradient_accumulation_steps = train_cfg.get('gradient_accumulation_steps', 32)
     num_workers = train_cfg.get('num_workers', 0)
     grad_clip = train_cfg.get('grad_clip', 1.0)
+    log_interval = train_cfg.get('log_interval', 1)
+    checkpoint_interval = train_cfg.get('checkpoint_interval', 500)
+
+    # AMP: bfloat16 mixed precision
+    use_amp = train_cfg.get('use_amp', False)
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    if use_amp:
+        print("bfloat16 mixed precision ENABLED (ternary weights exact in bf16)")
+
+    # torch.compile
+    use_compile = train_cfg.get('use_compile', False)
+    if use_compile:
+        try:
+            model = torch.compile(model, mode="reduce-overhead")
+            print("torch.compile enabled (reduce-overhead mode)")
+        except Exception as e:
+            print(f"torch.compile failed, continuing without: {e}")
 
     print(f"Training config: seq_len={seq_len}, batch_size={batch_size}, grad_accum={gradient_accumulation_steps}")
     print(f"  LR: other={learning_rate}, decay={decay_lr}, weight_decay={weight_decay}")
@@ -455,7 +466,7 @@ def train():
         min_seq_len=64,
         max_seq_len=seq_len,
         total_steps=total_opt_steps,
-        warmup_fraction=0.2,
+        warmup_fraction=0.1,
         strategy="linear",
     )
 
@@ -582,7 +593,10 @@ def train():
             print("Using streaming FineWeb-Edu dataset (10B tokens available)")
             dataset = StreamingFineWebDataset(seq_len=seq_len, tokenizer=tokenizer)
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True, prefetch_factor=2)
+        dl_kwargs = dict(batch_size=batch_size, num_workers=num_workers, pin_memory=True)
+        if num_workers > 0:
+            dl_kwargs['prefetch_factor'] = 2
+        dataloader = DataLoader(dataset, **dl_kwargs)
     else:
         bin_path = os.path.join(os.path.dirname(__file__), "tinystories_train.bin")
         dataset = BinaryDataset(bin_path, seq_len=seq_len)
@@ -627,9 +641,10 @@ def train():
                 x = x[:, :curr_seq_len]
                 y = y[:, :curr_seq_len]
 
-            logits = model(x)
-            loss = criterion(logits.reshape(-1, config['vocab_size']), y.reshape(-1))
-            loss = loss / gradient_accumulation_steps
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                logits = model(x)
+                loss = criterion(logits.reshape(-1, config['vocab_size']), y.reshape(-1))
+                loss = loss / gradient_accumulation_steps
             loss.backward()
             step_loss += loss.detach()
 
@@ -686,12 +701,14 @@ def train():
             nan_streak = 0
             last_valid_loss = loss_val
 
-        # Regular logging
-        current_lr = scheduler.get_last_lr()[0]
-        print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | LR: {current_lr:.2e} | GradNorm: {grad_norm:.2f} | SeqLen: {curr_seq_len} | Time: {elapsed:.2f}s", flush=True)
+        # Regular logging (also log first 5 steps for timing estimates)
+        if opt_step % log_interval == 0 or opt_step < 5 or opt_step == total_opt_steps - 1:
+            current_lr = scheduler.get_last_lr()[0]
+            total_elapsed = time.time() - start_time
+            print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | LR: {current_lr:.2e} | GradNorm: {grad_norm:.2f} | SeqLen: {curr_seq_len} | Time/step: {elapsed:.2f}s | Total: {total_elapsed/60:.1f}min", flush=True)
 
         # Checkpoint saving
-        if opt_step > 0 and opt_step % 500 == 0:
+        if opt_step > 0 and opt_step % checkpoint_interval == 0:
             ckpt_path = os.path.join(project_root, f"mamba_integer_step_{opt_step}.pt")
 
             # Validate before saving
