@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from rational_bitnet import BitLinear
 
+
 # Triton
 try:
     sys.path.append(os.path.dirname(__file__))
@@ -381,15 +382,9 @@ class MambaIntegerBlock(nn.Module):
         self.out_proj = BitLinear(d_inner, d_model)
         
         # FIX: Sigmoid reparameterization for decay (proper gradient flow)
-        # Old: base_decay_nums ∈ [0, 32000], gradient scaled by 1/32768 → effectively zero
-        # New: decay_logit ∈ ℝ, decay = sigmoid(decay_logit) * 32768
-        # sigmoid(0) = 0.5, so initial decay = 0.5 (equal weight to history vs new input)
-        # Gradient flows through sigmoid which has well-conditioned derivatives
         self.decay_logit = nn.Parameter(torch.zeros(d_inner, d_state))
         self.register_buffer('decay_shifts', torch.ones(d_inner, d_state) * 15.0)
         # P0 FIX: SkipInit-style initialization (1/sqrt(2*n_layer))
-        # Previous: 0.01 caused 10^-48 gradient attenuation through 24 layers
-        # Now: ~0.144 provides immediate gradient flow while remaining learnable
         n_layer = config.get('n_layer', 24)
         self.res_gate = nn.Parameter(torch.ones(1) / math.sqrt(2 * n_layer))
 
@@ -400,13 +395,11 @@ class MambaIntegerBlock(nn.Module):
         xz = self.in_proj(hidden_states)
         x, z = xz.chunk(2, dim=-1)
 
-        # 1. Conv + Fused Activation (INTEGER-ONLY)
+        # 1. Conv + Activation (INTEGER-ONLY)
         x = self.conv1d(x.transpose(1, 2)).transpose(1, 2)[:, :hidden_states.shape[1]]
-        # Fused: clamp(-50, 50) + squareplus activation
         if FUSED_KERNELS_AVAILABLE and x.is_cuda:
             x = fused_squareplus_clamp(x, low=-50.0, high=50.0)
         else:
-            # A4 FIX: Use ste_clamp instead of .clamp() to avoid flat gradient regions
             x = ste_clamp(x, -50.0, 50.0)
             x = _squareplus_rational(x, num_iters=3)
 
@@ -438,7 +431,7 @@ class MambaIntegerBlock(nn.Module):
         h_flat = DyadicScanFunction.apply(u_flat, dn_flat, ds_flat)
         h = h_flat.reshape(B_size, L_size, D_in, N)
 
-        # 4. Out with Fused Gating (INTEGER-ONLY)
+        # 4. Out with Gating (INTEGER-ONLY)
         y = torch.matmul(h, C_ssm.unsqueeze(-1)).squeeze(-1)
         if FUSED_KERNELS_AVAILABLE and y.is_cuda:
             y = fused_sigmoid_gate(y, z)

@@ -4,7 +4,7 @@
 
 set -e
 
-cd /home/jayantlohia16/experiment/mamba-integer
+cd "$(dirname "$0")"
 
 echo "=========================================="
 echo "Mamba-Integer Training Pipeline"

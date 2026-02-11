@@ -29,7 +29,6 @@
   },
   "rms_norm_eps": 1e-05,
   "use_bitshift_norm": true,
-  "use_square_activation": true,
   "weight_quantization": "bitnet_1.58",
   "model_type": "mamba_integer",
   "model_name": "mamba_integer_5m"

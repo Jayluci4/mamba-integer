@@ -6,6 +6,15 @@ __pycache__/
 # C extensions
 *.so
 
+# Rust build artifacts
+src/rust_tokenizer/target/
+
+# Training corpus (503MB+, regenerate with scripts/prepare_rust_bpe.py)
+scripts/domain_corpus.txt
+
+# Checkpoints directory
+checkpoints_v1_vocab4096/
+
 # Distribution / packaging
 node_modules/
 build/

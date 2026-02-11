@@ -15,8 +15,15 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../s
 from mamba_integer_model import MambaIntegerModel
 from rust_tokenizer import get_rust_tokenizer
 
+# Curriculum learning: progressive sequence length for stable early training
+from curriculum import CurriculumScheduler
+
 # --- Config ---
-CONFIG_PATH = os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json")
+# FIX: Accept config path from command line or env var
+CONFIG_PATH = os.environ.get('MAMBA_CONFIG',
+    sys.argv[1] if len(sys.argv) > 1 else
+    os.path.join(os.path.dirname(__file__), "../configs/config_mamba_integer_l4.json"))
+print(f"Loading config from: {CONFIG_PATH}")
 with open(CONFIG_PATH, 'r') as f:
     config = json.load(f)
 
@@ -24,42 +31,90 @@ with open(CONFIG_PATH, 'r') as f:
 USE_STREAMING = True
 
 # --- Dataset Configurations ---
-# Research-backed mix: 60% general, 25% code, 15% math
+# ZK-ML domain-focused mix: optimized for verifiable inference use cases
+# DeFi/smart contracts, mathematical reasoning, financial compliance, structured data
 DATASET_MIX = {
-    # Tier 1: High-quality general text (60%)
+    # Foundation: High-quality educational text (35%)
     "fineweb_edu": {
-        "weight": 0.60,
+        "weight": 0.35,
         "path": "HuggingFaceFW/fineweb-edu",
         "name": "sample-10BT",
         "text_field": "text",
         "description": "Educational web content - SOTA filtered (10B tokens)"
     },
 
-    # Tier 2: Code - tiny-codes (25%) - fast, high quality snippets
+    # Smart Contracts / Solidity (12%) - #1 ZK-ML use case
+    "solidity_disl": {
+        "weight": 0.12,
+        "path": "ASSERT-KTH/DISL",
+        "name": "decomposed",
+        "text_field": "source_code",
+        "description": "514K unique Solidity contracts from Ethereum"
+    },
+
+    # Code - general (8%) - programming syntax and reasoning
     "tiny_codes": {
-        "weight": 0.25,
+        "weight": 0.08,
         "path": "nampdn-ai/tiny-codes",
         "name": None,
-        "text_field": "prompt",  # or "response" for the code itself
+        "text_field": "response",
         "description": "1.6M high-quality code snippets (Textbooks Are All You Need)"
     },
 
-    # Tier 3: Math and Reasoning (15%)
+    # Mathematics (15%) - provably correct reasoning
     "openwebmath": {
         "weight": 0.15,
         "path": "open-web-math/open-web-math",
         "name": None,
         "text_field": "text",
         "description": "Mathematical web content (14.7B tokens)"
-    }
+    },
+
+    # Financial / SEC filings (10%) - EU AI Act compliance
+    "sec_filings": {
+        "weight": 0.10,
+        "path": "PleIAs/SEC",
+        "name": None,
+        "text_field": "text",
+        "description": "7.2B words from 245K SEC 10-K filings (1993-2024)"
+    },
+
+    # Structured data / SQL (10%) - verifiable data queries
+    "text_to_sql": {
+        "weight": 0.10,
+        "path": "gretelai/synthetic_text_to_sql",
+        "name": None,
+        "text_field": "sql",
+        "description": "105K synthetic text-to-SQL pairs"
+    },
+
+    # Synthetic textbooks (5%) - structured reasoning patterns
+    "cosmopedia": {
+        "weight": 0.05,
+        "path": "HuggingFaceTB/cosmopedia-v2",
+        "name": None,
+        "text_field": "text",
+        "description": "Synthetic textbooks, 34K topics (SmolLM foundation)"
+    },
+
+    # Complementary educational web (5%)
+    "dclm_edu": {
+        "weight": 0.05,
+        "path": "HuggingFaceTB/dclm-edu",
+        "name": None,
+        "text_field": "text",
+        "description": "DCLM educational quality filtered (SmolLM2 complement)"
+    },
 }
 
 # Set to False to use only FineWeb-Edu (faster, less diverse)
 USE_MIXED_DATASETS = True
 
-# HuggingFace token for gated datasets (e.g., StarCoder)
-# Set HF_TOKEN environment variable if needed
+# HuggingFace token for gated datasets
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
+if HF_TOKEN is None:
+    print("WARNING: HF_TOKEN not set. Some gated datasets may fail to load.")
+    print("  Set it with: export HF_TOKEN=your_token_here")
 
 
 # --- Mixed Streaming Dataset ---
@@ -90,10 +145,16 @@ class MixedStreamingDataset(IterableDataset):
             from datasets import load_dataset
             cfg = self.dataset_mix[name]
             try:
-                if cfg["name"]:
-                    ds = load_dataset(cfg["path"], name=cfg["name"], split="train", streaming=True, token=HF_TOKEN)
-                else:
-                    ds = load_dataset(cfg["path"], split="train", streaming=True, token=HF_TOKEN)
+                kwargs = {
+                    "path": cfg["path"],
+                    "split": "train",
+                    "streaming": True,
+                    "token": HF_TOKEN,
+                }
+                cfg_name = cfg.get("name")
+                if cfg_name:
+                    kwargs["name"] = cfg_name
+                ds = load_dataset(**kwargs)
                 self.iterators[name] = iter(ds)
                 print(f"  Loaded {name} successfully")
             except Exception as e:
@@ -115,9 +176,18 @@ class MixedStreamingDataset(IterableDataset):
         try:
             while len(self.buffers[name]) < min_tokens:
                 doc = next(iterator)
-                # Handle datasets with multiple text fields (e.g., tiny-codes has prompt+response)
-                if text_field == "prompt" and "response" in doc:
+                # Handle datasets with multiple text fields
+                if text_field == "response" and "prompt" in doc:
+                    # tiny-codes: combine prompt + response
                     text = doc.get("prompt", "") + "\n" + doc.get("response", "")
+                elif text_field == "sql" and "sql_context" in doc:
+                    # text-to-sql: combine context + prompt + query
+                    text = (doc.get("sql_context", "") + "\n-- " +
+                            doc.get("sql_prompt", "") + "\n" +
+                            doc.get("sql", ""))
+                elif text_field == "source_code":
+                    # Solidity: use source_code directly
+                    text = doc.get("source_code", "")
                 else:
                     text = doc.get(text_field, "")
                 if text:
@@ -212,9 +282,9 @@ class BinaryDataset(Dataset):
         chunk = self.data[offset : offset + self.seq_len + 1].astype(np.int64)
         x = torch.from_numpy(chunk[:-1])
         y = torch.from_numpy(chunk[1:])
-        y_masked = y.clone()
-        y_masked[y == 0] = -100
-        return x, y_masked
+        # FIX: Removed y_masked[y == 0] = -100 — token 0 is a valid byte token
+        # Masking it excluded a common token from loss, hurting training
+        return x, y
 
 
 def validate_optimizer_state(optimizer, checkpoint_opt_state, expected_params):
@@ -293,7 +363,10 @@ def warmup_triton_kernels(model, config, device='cuda'):
     sequence lengths upfront, we ensure all kernel variants are pre-compiled.
     """
     print("Warming up Triton kernels...")
-    print("AMP enabled with torch.bfloat16 (A100/H100 optimized)")
+    # FIX: Removed bfloat16 AMP — bf16 has only 8-bit mantissa which corrupts
+    # integer quantization that needs 15+ bits of precision.
+    # Training in float32 ensures integer ops work correctly.
+    print("Using float32 (integer quantization requires full precision)")
     model.eval()
     train_seq_len = config.get('training', {}).get('seq_len', 1024)
     warmup_seq_lens = [64, 128, 256, 512] + ([train_seq_len] if train_seq_len > 512 else [])
@@ -301,8 +374,7 @@ def warmup_triton_kernels(model, config, device='cuda'):
         for seq_len in warmup_seq_lens:
             x = torch.randint(0, config['vocab_size'], (2, seq_len), device=device)
             try:
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    _ = model(x)
+                _ = model(x)
                 torch.cuda.synchronize()
                 print(f"  Warmup pass seq_len={seq_len} complete")
             except Exception as e:
@@ -313,9 +385,8 @@ def warmup_triton_kernels(model, config, device='cuda'):
     # Also warm up backward pass at training seq_len
     model.train()
     x = torch.randint(0, config['vocab_size'], (2, train_seq_len), device=device)
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        logits = model(x)
-        loss = logits.sum()
+    logits = model(x)
+    loss = logits.sum()
     loss.backward()
     model.zero_grad()
     torch.cuda.synchronize()
@@ -340,21 +411,16 @@ def train():
     num_params = len(list(model.parameters()))
     print(f"Model has {num_params} parameter tensors")
 
-    # 2. Optimizer & Scheduler Setup (before torch.compile)
+    # 2. Optimizer & Scheduler Setup
     decay_params = []
     other_params = []
     for name, param in model.named_parameters():
-        if "base_decay_nums" in name:
+        if "decay_logit" in name:
             decay_params.append(param)
         else:
             other_params.append(param)
 
     print(f"Decay params: {len(decay_params)}, Other params: {len(other_params)}")
-
-    # torch.compile disabled - conflicts with custom Triton kernels
-    # TODO: Re-enable after fixing kernel compatibility
-    # print("Applying torch.compile (this may take a few minutes on first run)...")
-    # model = torch.compile(model, mode='default')
     print("Running without torch.compile (custom Triton kernels active)")
 
     # Training hyperparameters from config
@@ -362,8 +428,7 @@ def train():
     learning_rate = train_cfg.get('learning_rate', 1e-3)
     decay_lr = train_cfg.get('decay_lr', 5e-3)
     weight_decay = train_cfg.get('weight_decay', 0.01)
-    # BitNet paper: remove weight decay in second half of training for faster convergence
-    WEIGHT_DECAY_CUTOFF = 64000  # Disable weight decay after this step
+    WEIGHT_DECAY_CUTOFF = 64000
     total_opt_steps = train_cfg.get('total_steps', 15000)
     seq_len = train_cfg.get('seq_len', 512)
     batch_size = train_cfg.get('batch_size', 2)
@@ -375,17 +440,23 @@ def train():
     print(f"  LR: other={learning_rate}, decay={decay_lr}, weight_decay={weight_decay}")
     print(f"  Total steps: {total_opt_steps}, grad_clip={grad_clip}")
 
-    # P1 FIX: Increased learning rate for other_params from 5e-4 to 1e-3
-    # SSM models (Mamba, minGRU) typically need higher LR than transformers
-    # decay_params at 5x (was 10x) relative to other_params
     optimizer = optim.AdamW([
         {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
         {'params': other_params, 'lr': learning_rate, 'weight_decay': weight_decay}
     ])
 
-    # P1 FIX: Updated max_lr to match new base LR (1e-3 for other_params)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps, pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
+        optimizer, max_lr=[decay_lr, learning_rate], total_steps=total_opt_steps,
+        pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
+    )
+
+    # Curriculum learning: progressive sequence length for stable early training
+    curriculum = CurriculumScheduler(
+        min_seq_len=64,
+        max_seq_len=seq_len,
+        total_steps=total_opt_steps,
+        warmup_fraction=0.2,
+        strategy="linear",
     )
 
     # --- Auto-Resume Logic (with validation) ---
@@ -435,11 +506,10 @@ def train():
                     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
 
                     # FORCE NEW LR: Always recreate optimizer/scheduler with config values
-                    # This ensures LR changes in config take effect on resume
-                    # BitNet paper: remove weight decay after WEIGHT_DECAY_CUTOFF for faster convergence
                     effective_weight_decay = 0.0 if step_num >= WEIGHT_DECAY_CUTOFF else weight_decay
                     print(f"Creating fresh optimizer with LR from config: decay={decay_lr}, other={learning_rate}")
-                    print(f"  Weight decay: {effective_weight_decay} (cutoff at step {WEIGHT_DECAY_CUTOFF})")
+                    decay_params = [p for n, p in model.named_parameters() if "decay_logit" in n]
+                    other_params = [p for n, p in model.named_parameters() if "decay_logit" not in n]
                     optimizer = optim.AdamW([
                         {'params': decay_params, 'lr': decay_lr, 'weight_decay': 0.0},
                         {'params': other_params, 'lr': learning_rate, 'weight_decay': effective_weight_decay}
@@ -449,9 +519,9 @@ def train():
                         pct_start=0.1, anneal_strategy='cos', div_factor=10.0, final_div_factor=100.0
                     )
                     # Fast-forward scheduler to current step
-                    for _ in range(step_num + 1):
+                    for _ in range(step_num):
                         scheduler.step()
-                    print(f"Scheduler fast-forwarded to step {step_num + 1}")
+                    print(f"Scheduler fast-forwarded to step {step_num}")
 
                     start_step = checkpoint["step"] + 1
 
@@ -486,7 +556,23 @@ def train():
     # 3. Data
     if USE_STREAMING:
         tokenizer = get_rust_tokenizer()
-        merges_path = os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt")
+        # Auto-select merges file based on vocab size
+        vocab_size = config['vocab_size']
+        merges_candidates = [
+            os.path.join(os.path.dirname(__file__), f"../configs/rust_bpe_merges_{vocab_size}.txt"),
+            os.path.join(os.path.dirname(__file__), "../configs/rust_bpe_merges.txt"),
+        ]
+        merges_path = None
+        for mp in merges_candidates:
+            if os.path.exists(mp):
+                merges_path = mp
+                break
+        if merges_path is None:
+            raise FileNotFoundError(
+                f"No merges file found for vocab_size={vocab_size}. "
+                f"Run: python scripts/prepare_rust_bpe.py --vocab-size {vocab_size}"
+            )
+        print(f"Loading tokenizer merges from: {merges_path}")
         tokenizer.load(merges_path)
 
         if USE_MIXED_DATASETS:
@@ -496,7 +582,7 @@ def train():
             print("Using streaming FineWeb-Edu dataset (10B tokens available)")
             dataset = StreamingFineWebDataset(seq_len=seq_len, tokenizer=tokenizer)
 
-        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=0, pin_memory=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, pin_memory=True, prefetch_factor=2)
     else:
         bin_path = os.path.join(os.path.dirname(__file__), "tinystories_train.bin")
         dataset = BinaryDataset(bin_path, seq_len=seq_len)
@@ -518,11 +604,14 @@ def train():
     max_nan_streak = 3  # Stop after 3 consecutive NaN losses
     last_valid_loss = float('inf')
 
-    print(f"Starting High-Speed Loop from Step {start_step}...")
+    print(f"Starting training from step {start_step}...")
     data_iter = iter(dataloader)
 
     for opt_step in range(start_step, total_opt_steps):
         step_loss = torch.tensor(0.0, device=device)
+
+        # Curriculum: progressive sequence length for stable early training
+        curr_seq_len = curriculum.get_seq_len(opt_step)
 
         for _ in range(gradient_accumulation_steps):
             try:
@@ -532,9 +621,14 @@ def train():
                 x, y = next(data_iter)
 
             x, y = x.to(device), y.to(device)
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                logits = model(x)
-                loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
+
+            # Curriculum: truncate to current sequence length
+            if curr_seq_len < x.shape[1]:
+                x = x[:, :curr_seq_len]
+                y = y[:, :curr_seq_len]
+
+            logits = model(x)
+            loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
             loss = loss / gradient_accumulation_steps
             loss.backward()
             step_loss += loss.detach()
@@ -581,6 +675,9 @@ def train():
                 torch.save({
                     'step': opt_step,
                     'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'last_valid_loss': last_valid_loss,
                     'note': 'Emergency save due to NaN loss'
                 }, emergency_path)
                 print(f"Emergency checkpoint saved to: {emergency_path}")
@@ -591,7 +688,7 @@ def train():
 
         # Regular logging
         current_lr = scheduler.get_last_lr()[0]
-        print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | LR: {current_lr:.2e} | GradNorm: {grad_norm:.2f} | Time: {elapsed:.2f}s", flush=True)
+        print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | LR: {current_lr:.2e} | GradNorm: {grad_norm:.2f} | SeqLen: {curr_seq_len} | Time: {elapsed:.2f}s", flush=True)
 
         # Checkpoint saving
         if opt_step > 0 and opt_step % 500 == 0:
