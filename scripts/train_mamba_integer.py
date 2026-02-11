@@ -92,7 +92,7 @@ DATASET_MIX = {
     "cosmopedia": {
         "weight": 0.05,
         "path": "HuggingFaceTB/cosmopedia-v2",
-        "name": None,
+        "name": "cosmopedia-v2",
         "text_field": "text",
         "description": "Synthetic textbooks, 34K topics (SmolLM foundation)"
     },
@@ -628,7 +628,7 @@ def train():
                 y = y[:, :curr_seq_len]
 
             logits = model(x)
-            loss = criterion(logits.view(-1, config['vocab_size']), y.view(-1))
+            loss = criterion(logits.reshape(-1, config['vocab_size']), y.reshape(-1))
             loss = loss / gradient_accumulation_steps
             loss.backward()
             step_loss += loss.detach()
