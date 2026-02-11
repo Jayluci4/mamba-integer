@@ -9,8 +9,9 @@ Tests:
 """
 
 import sys
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src')
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
 import torch.nn as nn

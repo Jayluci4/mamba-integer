@@ -198,7 +198,7 @@ def surprise_ssd_forward(
     surprise_list = []
 
     # Convert A from log space to decay factor
-    A_decay_base = torch.exp(A)  # [B, L, n_heads], values in (0, 1)
+    A_decay_base = torch.exp(A.clamp(min=-88.0, max=0.0))  # [B, L, n_heads], values in (0, 1)
 
     for t in range(seqlen):
         # Get inputs for this timestep

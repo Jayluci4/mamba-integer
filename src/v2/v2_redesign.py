@@ -17,7 +17,8 @@ import math
 from typing import Optional, Tuple, List, Dict
 
 import sys
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from triton_kernels.ssd_multihead import build_causal_decay_matrix_multihead
 
@@ -238,11 +239,11 @@ def convex_ssd_chunk_forward(
     Y_intra = torch.einsum('bhij,bhjd->bhid', L_CB, X_chunk)
 
     # Compute chunk contribution to state
-    decay_to_end = torch.exp(A_cumsum[:, :, -1:] - A_cumsum)
+    decay_to_end = torch.exp((A_cumsum[:, :, -1:] - A_cumsum).clamp(min=-88.0, max=0.0))
     h_chunk_contrib = torch.einsum('bhts,bhtd,bht->bhsd', B_chunk, X_chunk, decay_to_end)
 
     # Compute decay of previous state
-    decay_total = torch.exp(A_cumsum[:, :, -1])  # [B, n_heads]
+    decay_total = torch.exp(A_cumsum[:, :, -1].clamp(min=-88.0, max=0.0))  # [B, n_heads]
     h_prev_decayed = decay_total.unsqueeze(-1).unsqueeze(-1) * h_prev
 
     # CONVEX COMBINATION: h = α * h_prev_decayed + (1 - α) * h_chunk_contrib
@@ -250,7 +251,7 @@ def convex_ssd_chunk_forward(
     h_end = alpha * h_prev_decayed + (1 - alpha) * h_chunk_contrib
 
     # Inter-chunk contribution to output
-    decay_from_start = torch.exp(A_cumsum)
+    decay_from_start = torch.exp(A_cumsum.clamp(min=-88.0, max=0.0))
     # Scale inter-chunk by α (preserve old state contribution)
     Y_inter = alpha * torch.einsum('bhis,bhsd,bhi->bhid', C_chunk, h_prev, decay_from_start)
 

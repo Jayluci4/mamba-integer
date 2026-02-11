@@ -10,7 +10,11 @@ This enables ZK-ML compatibility and edge deployment.
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+try:
+    from triton.language.extra.cuda import libdevice
+    _HAS_LIBDEVICE = True
+except (ImportError, RuntimeError):
+    _HAS_LIBDEVICE = False
 
 # --- Forward Kernels ---
 
@@ -37,8 +41,10 @@ def quantize_activations_kernel(
     tl.store(scale_ptr + pid, scale)
 
     q_factor = 127.0 / scale
-    # Use libdevice.rint for Triton 3.x compatibility (tl.math.rint was removed)
-    x_quant = libdevice.rint(x * q_factor)
+    # Round to nearest integer (portable across CUDA and ROCm)
+    scaled = x * q_factor
+    x_quant = (scaled + 0.5).to(tl.int32).to(tl.float32)
+    x_quant = tl.where(scaled < 0, (scaled - 0.5).to(tl.int32).to(tl.float32), x_quant)
     # tl.clamp not available in Triton 2.3, use min/max instead
     x_quant = tl.minimum(tl.maximum(x_quant, -127.0), 127.0)
 
@@ -221,7 +227,7 @@ def fast_bitnet_matmul_backward(grad_output, x_quant, w_quant, x_scale, w_scale)
     g_scaled_x = grad_output * w_scale.view(1, -1)
     grad_x = torch.matmul(g_scaled_x, w_quant.float()) * x_scale.view(-1, 1)
     g_scaled_w = grad_output * x_scale.view(-1, 1)
-    grad_w = torch.matmul(g_scaled_w.t(), x_quant.float()) * w_scale.view(-1, 1)
+    grad_w = torch.matmul(g_scaled_w.t(), x_quant.float()) * w_scale.view(1, -1)
     return grad_x, grad_w
 
 # --- Optimized BitShiftNorm (INTEGER-ONLY) ---

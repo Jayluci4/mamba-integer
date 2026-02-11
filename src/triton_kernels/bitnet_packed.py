@@ -16,7 +16,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import triton
 import triton.language as tl
-from triton.language.extra.cuda import libdevice
+try:
+    from triton.language.extra.cuda import libdevice
+    _HAS_LIBDEVICE = True
+except (ImportError, RuntimeError):
+    _HAS_LIBDEVICE = False
 from typing import Tuple
 import math
 
@@ -315,7 +319,7 @@ class PackedBitLinear(nn.Module):
 
             # Activation quantization
             x_scale = x.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-            x_quant = x + (torch.round(x * 127 / x_scale).clamp(-127, 127) * x_scale / 127 - x).detach()
+            x_quant = x + (torch.round(x * 127 / x_scale).clamp(-127, 127) / 127 * x_scale - x).detach()
 
             # Matmul
             y = F.linear(x_quant, w_quant * scale, None)
@@ -380,7 +384,10 @@ def autotuned_quantize_kernel(
 
     # Quantize to int8 range
     q_factor = 127.0 / scale
-    x_quant = libdevice.rint(x * q_factor)
+    # Round to nearest integer (portable across CUDA and ROCm)
+    scaled = x * q_factor
+    x_quant = (scaled + 0.5).to(tl.int32).to(tl.float32)
+    x_quant = tl.where(scaled < 0, (scaled - 0.5).to(tl.int32).to(tl.float32), x_quant)
     x_quant = tl.minimum(tl.maximum(x_quant, -127.0), 127.0)
 
     tl.store(x_quant_ptr + row_start + offsets, x_quant, mask=mask)

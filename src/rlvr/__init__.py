@@ -9,8 +9,14 @@ from .rewards import (
     FormatReward,
     CompositeReward,
 )
-from .grpo import GRPOTrainer
-from .zk_rewards import ZKVerifiableReward, IntegerArithmeticProof
+from .grpo import GRPOTrainer, GRPOConfig, MathProblemDataset
+from .zk_rewards import (
+    ZKVerifiableReward,
+    IntegerArithmeticProof,
+    ZKIntegerArithmeticReward,
+    ZKDyadicRationalReward,
+    ZKCompositeReward,
+)
 
 __all__ = [
     "VerifiableReward",
@@ -20,6 +26,11 @@ __all__ = [
     "FormatReward",
     "CompositeReward",
     "GRPOTrainer",
+    "GRPOConfig",
+    "MathProblemDataset",
     "ZKVerifiableReward",
     "IntegerArithmeticProof",
+    "ZKIntegerArithmeticReward",
+    "ZKDyadicRationalReward",
+    "ZKCompositeReward",
 ]

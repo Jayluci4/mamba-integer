@@ -9,12 +9,20 @@ import torch
 import ctypes
 import os
 
+# Detect ROCm/HIP environment before attempting to load CUDA-only libraries
+_IS_ROCM = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
 # Load the CUDA kernel library
 _lib_path = os.path.join(os.path.dirname(__file__), "../cuda_kernels/libwarp_scan.so")
 _lib = None
 
 def _load_library():
     global _lib
+    if _IS_ROCM:
+        # warp_scan uses CUDA warp shuffle ops, not available on ROCm/HIP
+        print("DEBUG: Skipping CUDA warp scan kernel load — ROCm/HIP platform detected. "
+              "CUDA warp shuffle operations are not supported on AMD GPUs.")
+        return None
     if _lib is None:
         if os.path.exists(_lib_path):
             _lib = ctypes.CDLL(_lib_path)
@@ -51,9 +59,12 @@ def _load_library():
     return _lib
 
 # Try to load on import
-_load_library()
-
-WARP_SCAN_AVAILABLE = _lib is not None
+if _IS_ROCM:
+    WARP_SCAN_AVAILABLE = False
+    # warp_scan uses CUDA warp shuffle ops, not available on ROCm/HIP
+else:
+    _load_library()
+    WARP_SCAN_AVAILABLE = _lib is not None
 
 
 class WarpScanFunction(torch.autograd.Function):
@@ -157,6 +168,12 @@ def warp_scan_cuda(u, decay_nums):
         h: Output tensor [B, L, D]
     """
     if not WARP_SCAN_AVAILABLE:
+        if _IS_ROCM:
+            raise RuntimeError(
+                "CUDA warp scan kernel is not compatible with ROCm/HIP. "
+                "The kernel uses CUDA warp shuffle operations which are not available on AMD GPUs. "
+                "Use the Triton associative_scan fallback instead."
+            )
         raise RuntimeError("CUDA warp scan kernel not available. Build with 'make libwarp_scan.so'")
 
     return WarpScanFunction.apply(u, decay_nums)

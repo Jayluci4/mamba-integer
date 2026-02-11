@@ -22,7 +22,8 @@ from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 
 import sys
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from triton_kernels.ssd_multihead import build_causal_decay_matrix_multihead
 
@@ -592,15 +593,15 @@ def ssd_chunk_forward(
     L_CB = L * CB
     Y_intra = torch.einsum('bhij,bhjd->bhid', L_CB, X_chunk)
 
-    decay_from_start = torch.exp(A_cumsum)
+    decay_from_start = torch.exp(A_cumsum.clamp(min=-88.0, max=0.0))
     Y_inter = torch.einsum('bhis,bhsd,bhi->bhid', C_chunk, h_prev, decay_from_start)
 
     Y_chunk = Y_intra + Y_inter
 
-    decay_to_end = torch.exp(A_cumsum[:, :, -1:] - A_cumsum)
+    decay_to_end = torch.exp((A_cumsum[:, :, -1:] - A_cumsum).clamp(min=-88.0, max=0.0))
     h_chunk_contrib = torch.einsum('bhts,bhtd,bht->bhsd', B_chunk, X_chunk, decay_to_end)
 
-    decay_total = torch.exp(A_cumsum[:, :, -1])
+    decay_total = torch.exp(A_cumsum[:, :, -1].clamp(min=-88.0, max=0.0))
     h_end = decay_total.unsqueeze(-1).unsqueeze(-1) * h_prev + h_chunk_contrib
 
     return Y_chunk, h_end, decay_total

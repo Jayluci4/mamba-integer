@@ -76,7 +76,7 @@ def weight_quant_ternary(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     - Clamp at 1e-6 ensures meaningful ternary quantization
     """
     # AbsMean scaling with MINIMUM SCALE CLAMP (prevents distribution collapse)
-    scale = torch.max(w.abs().mean(), torch.tensor(1e-6, device=w.device, dtype=w.dtype))
+    scale = w.abs().mean().clamp(min=1e-6)
 
     # Normalize and round to {-1, 0, 1}
     w_normalized = w / scale
@@ -296,7 +296,7 @@ class RationalRMSNorm(nn.Module):
     followed by inversion for more reliable convergence.
     """
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6, n_iterations: int = 10, use_triton: bool = True):
+    def __init__(self, hidden_size: int, eps: float = 1e-6, n_iterations: int = 15, use_triton: bool = True):
         super().__init__()
         self.hidden_size = hidden_size
         self.eps = eps
@@ -327,7 +327,8 @@ class RationalRMSNorm(nn.Module):
         # or mul by 10^-2k. We can use mul.
         
         # Initial guess for x_norm \in [1, 100] -> rsqrt \in [0.1, 1]
-        y = torch.full_like(x_norm, 0.1) # Safe guess
+        # Use 1/(0.5 + 0.5*x_norm) as initial guess - much closer to true rsqrt
+        y = 1.0 / (0.5 + 0.5 * x_norm)
         
         # Iteration: y = 0.5 * y * (3 - x * y^2)
         half_x = 0.5 * x_norm
@@ -573,7 +574,7 @@ class DyadicRoPE(nn.Module):
         try:
             # Assume lib is in known location relative to repo root
             # Adjusted path for this context
-            lib_path = "/home/jayantlohia16/experiment/gemma-intelligent/conv/src/dyadic_experiment/cuda/libdyadic_rope.so"
+            lib_path = os.path.join(os.path.dirname(__file__), "cuda_kernels", "libdyadic_rope.so")
             if os.path.exists(lib_path):
                 self.lib = ctypes.CDLL(lib_path)
                 self.lib.launch_dyadic_rope.argtypes = [
@@ -693,13 +694,26 @@ class DyadicRoPE(nn.Module):
             return q_out, k_out
             
         else:
-            # Fallback to standard RationalRoPE logic (simulated)
-            # Reconstruct cos/sin from params? Or just use floating point?
-            # Let's just forward to a temporary RationalRoPE for CPU fallback
-            # (Or implement the shear logic in PyTorch - slow but correct)
-            # For demo, we just return un-rotated if kernel missing to signal error, or identity.
-            # Better: Keep existing RationalRoPE logic as fallback.
-            return q, k # Placeholder if CPU
+            # FIX: Proper Cayley rotation fallback (was returning un-rotated vectors!)
+            # Uses Cayley transform: cos = (1-t²)/(1+t²), sin = 2t/(1+t²)
+            # where t = tan(θ/2), precomputed from inv_freq
+            seq_len = q.shape[2]
+            indices = position_ids[0]  # [S]
+            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=q.device).float() / self.dim))
+            t_vals = indices.unsqueeze(-1).float() * inv_freq.unsqueeze(0) * 0.5  # tan(θ/2) ≈ θ/2
+            t_sq = t_vals * t_vals
+            denom = 1.0 + t_sq
+            cos_vals = (1.0 - t_sq) / denom  # [S, D/2]
+            sin_vals = (2.0 * t_vals) / denom  # [S, D/2]
+            cos_vals = cos_vals.unsqueeze(0).unsqueeze(0)  # [1, 1, S, D/2]
+            sin_vals = sin_vals.unsqueeze(0).unsqueeze(0)
+            head_dim = q.shape[-1]
+            half = head_dim // 2
+            q1, q2 = q[..., :half], q[..., half:]
+            k1, k2 = k[..., :half], k[..., half:]
+            q_out = torch.cat([q1 * cos_vals - q2 * sin_vals, q1 * sin_vals + q2 * cos_vals], dim=-1)
+            k_out = torch.cat([k1 * cos_vals - k2 * sin_vals, k1 * sin_vals + k2 * cos_vals], dim=-1)
+            return q_out, k_out
 
 
 # =============================================================================

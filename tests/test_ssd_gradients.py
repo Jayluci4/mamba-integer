@@ -1,8 +1,9 @@
 """Test SSD multihead gradient computation."""
 
 import sys
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src')
-sys.path.insert(0, '/home/jayantlohia16/mamba-integer/src/triton_kernels')
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src', 'triton_kernels'))
 
 import torch
 import torch.nn.functional as F

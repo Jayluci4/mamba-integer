@@ -137,9 +137,13 @@ def dyadic_scan_parallel_kernel(
         # Store results
         tl.store(h_ptr + ptr_offs, h_vals, mask=mask)
 
-        # Update carry for next block
+        # Update carry for next block using associative combiner:
+        # (carry_a, carry_b) ⊕ (scan_a, scan_b) = (scan_a * carry_a, scan_a * carry_b + scan_b)
         last_idx = block_size - 1
-        carry_b = tl.sum(tl.where(offs == last_idx, h_vals, 0.0))
+        last_scan_a = tl.sum(tl.where(offs == last_idx, scan_a, 0.0))
+        last_scan_b = tl.sum(tl.where(offs == last_idx, scan_b, 0.0))
+        carry_b = last_scan_a * carry_b + last_scan_b
+        carry_a = last_scan_a * carry_a
 
 
 @triton.jit
@@ -165,6 +169,7 @@ def dyadic_scan_bwd_parallel_kernel(
 
     base_offset = pid_b * stride_b + pid_d * stride_d
 
+    carry_grad_a = 1.0  # Identity for multiplicative carry
     carry_grad = 0.0
     num_blocks = (L + BLOCK_L - 1) // BLOCK_L
 
@@ -225,8 +230,12 @@ def dyadic_scan_bwd_parallel_kernel(
         tl.store(grad_nums_ptr + base_offset + (block_start + rev_offs) * stride_l,
                  g_nums_rev, mask=rev_mask)
 
+        # Update carry using associative combiner for backward scan
         last_idx = block_size - 1
-        carry_grad = tl.sum(tl.where(offs == last_idx, d_h_acc_rev, 0.0))
+        last_scan_a = tl.sum(tl.where(offs == last_idx, scan_a, 0.0))
+        last_scan_b = tl.sum(tl.where(offs == last_idx, scan_b, 0.0))
+        carry_grad = last_scan_a * carry_grad + last_scan_b
+        carry_grad_a = last_scan_a * carry_grad_a
 
         if block_start > 0:
             carry_h_prev = tl.load(h_ptr + base_offset + (block_start - 1) * stride_l)
@@ -368,8 +377,13 @@ def dyadic_scan_parallel_kernel_fast(
 
         tl.store(h_ptr + ptr_offs, h_vals, mask=mask)
 
+        # Update carry for next block using associative combiner:
+        # (carry_a, carry_b) ⊕ (scan_a, scan_b) = (scan_a * carry_a, scan_a * carry_b + scan_b)
         last_idx = block_size - 1
-        carry_b = tl.sum(tl.where(offs == last_idx, h_vals, 0.0))
+        last_scan_a = tl.sum(tl.where(offs == last_idx, scan_a, 0.0))
+        last_scan_b = tl.sum(tl.where(offs == last_idx, scan_b, 0.0))
+        carry_b = last_scan_a * carry_b + last_scan_b
+        carry_a = last_scan_a * carry_a
 
 
 # P1 FIX: Removed autotune from backward kernel as well
@@ -403,6 +417,7 @@ def dyadic_scan_bwd_parallel_kernel_fast(
     base_offset = pid_b * stride_b + pid_d * stride_d
     SCALE_15: tl.constexpr = 0.000030517578125  # 1/32768
 
+    carry_grad_a = 1.0  # Identity for multiplicative carry
     carry_grad = 0.0
     num_blocks = (L + BLOCK_L - 1) // BLOCK_L
 
@@ -450,8 +465,12 @@ def dyadic_scan_bwd_parallel_kernel_fast(
         tl.store(grad_nums_ptr + base_offset + (block_start + rev_offs) * stride_l,
                  g_nums_rev, mask=rev_mask)
 
+        # Update carry using associative combiner for backward scan
         last_idx = block_size - 1
-        carry_grad = tl.sum(tl.where(offs == last_idx, d_h_acc_rev, 0.0))
+        last_scan_a = tl.sum(tl.where(offs == last_idx, scan_a, 0.0))
+        last_scan_b = tl.sum(tl.where(offs == last_idx, scan_b, 0.0))
+        carry_grad = last_scan_a * carry_grad + last_scan_b
+        carry_grad_a = last_scan_a * carry_grad_a
 
         if block_start > 0:
             carry_h_prev = tl.load(h_ptr + base_offset + (block_start - 1) * stride_l)
@@ -877,9 +896,9 @@ def chunked_scan_bwd_pass3_kernel(
     # h_prev is h at position t-1
     h_prev = tl.load(h_ptr + pid_b * stride_b + (pos - 1) * stride_l + pid_d * stride_d,
                      mask=(mask & (pos > 0)), other=0.0)
-    # For first position of each chunk (except chunk 0), need h from previous chunk
-    # For simplicity, just use 0 for chunk boundaries
-    h_prev = tl.where(offs == 0, 0.0, h_prev)
+    # Only zero out h_prev for the very first position of the entire sequence
+    # (chunk 0, offs 0). For other chunk boundaries, pos > 0 so h[pos-1] is valid.
+    h_prev = tl.where((offs == 0) & (chunk_start == 0), 0.0, h_prev)
 
     grad_nums = grad_h_acc * (h_prev - u_vals) * SCALE_15
     tl.store(grad_nums_ptr + ptr_offs, grad_nums, mask=mask)

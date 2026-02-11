@@ -380,12 +380,12 @@ class MambaIntegerBlock(nn.Module):
         self.dt_proj = BitLinear(dt_rank, d_inner)
         self.out_proj = BitLinear(d_inner, d_model)
         
-        # P1 FIX: Initialize decay_nums for decay = 0.5 (not 0.96)
-        # Previous: 31500/32768 ≈ 0.96 caused slow gradient propagation
-        # Now: 16384/32768 = 0.5 allows equal weight to history vs new input
-        # Uses CONVEX COMBINATION: h = decay*h_prev + (1-decay)*u
-        # Reference: "Were RNNs All We Needed?" recommends decay near 0.5 at init
-        self.base_decay_nums = nn.Parameter(torch.ones(d_inner, d_state) * 16384.0)
+        # FIX: Sigmoid reparameterization for decay (proper gradient flow)
+        # Old: base_decay_nums ∈ [0, 32000], gradient scaled by 1/32768 → effectively zero
+        # New: decay_logit ∈ ℝ, decay = sigmoid(decay_logit) * 32768
+        # sigmoid(0) = 0.5, so initial decay = 0.5 (equal weight to history vs new input)
+        # Gradient flows through sigmoid which has well-conditioned derivatives
+        self.decay_logit = nn.Parameter(torch.zeros(d_inner, d_state))
         self.register_buffer('decay_shifts', torch.ones(d_inner, d_state) * 15.0)
         # P0 FIX: SkipInit-style initialization (1/sqrt(2*n_layer))
         # Previous: 0.01 caused 10^-48 gradient attenuation through 24 layers
@@ -418,12 +418,14 @@ class MambaIntegerBlock(nn.Module):
 
         decay_mod = self.dt_proj(dt)
         # A4 FIX: Use ste_clamp for decay_mod to avoid flat gradient regions
-        # Range [-20, 20] ensures decay_nums stays in valid range after modulation
         decay_mod = ste_clamp(decay_mod, -20.0, 20.0)
+        # FIX: Algebraic sigmoid reparameterization — ZERO transcendentals
+        # Uses z/(1+|z|) which is rational (no exp), gradient-friendly, and ZK-provable
+        # Maps decay_logit ∈ (-∞, +∞) → base_decay ∈ (0, 32768)
+        base_decay_nums = (0.5 + 0.5 * self.decay_logit / (1.0 + torch.abs(self.decay_logit))) * 32768.0
         # decay_nums must be in [0, 32000] for dyadic scan
-        decay_nums = ste_clamp(self.base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1), 0, 32000)
+        decay_nums = ste_clamp(base_decay_nums.unsqueeze(0).unsqueeze(0) + decay_mod.unsqueeze(-1), 0, 32000)
         # A3 FIX: dt_val bounds [0.001, 0.1] - Mamba uses log-uniform in this range
-        # Previous: lower bound 0 was too restrictive
         dt_val = ste_clamp(_squareplus_rational(decay_mod, num_iters=3) * 0.01, 0.001, 0.1)
         u = (x * dt_val).unsqueeze(-1) * B_ssm.unsqueeze(2)
 
@@ -467,7 +469,11 @@ class MambaIntegerModel(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.embedding = nn.Embedding(config['vocab_size'], config['d_model'])
+        d_model = config['d_model']
+
+        # FIX: Scale embeddings by sqrt(d_model) (standard transformer practice)
+        self.embedding = nn.Embedding(config['vocab_size'], d_model)
+        self.embed_scale = math.sqrt(d_model)
 
         # S1 FIX: Use memory-efficient multi-head SSD block when enabled
         use_ssd = config.get('ssm_cfg', {}).get('use_ssd', False)
@@ -478,18 +484,25 @@ class MambaIntegerModel(nn.Module):
             print(f"Using MambaIntegerBlock (dyadic scan) for {config['n_layer']} layers")
             self.layers = nn.ModuleList([MambaIntegerBlock(config, i) for i in range(config['n_layer'])])
 
-        self.norm_f = BitShiftNorm(config['d_model'])
-        self.lm_head = BitLinear(config['d_model'], config['vocab_size'])
-        self.output_scale = 1.0 / math.sqrt(config['d_model'])
+        self.norm_f = BitShiftNorm(d_model)
+
+        # FIX: Use regular nn.Linear for lm_head (output projection should NOT be quantized)
+        # BitLinear's ternary quantization + rescaling crushes logit magnitudes
+        # Standard practice: keep output projection in full precision
+        self.lm_head = nn.Linear(d_model, config['vocab_size'], bias=False)
+        # Proper init: small but not crushed
+        nn.init.normal_(self.lm_head.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+
+        # FIX: REMOVED output_scale (was 1/sqrt(d_model) ≈ 0.044, crushing logits 22x)
+        # The lm_head now produces properly-scaled logits directly
         self.gradient_checkpointing = False
-        
+
     def forward(self, input_ids):
-        x = self.embedding(input_ids)
+        # FIX: Apply embedding scaling (standard transformer practice)
+        x = self.embedding(input_ids) * self.embed_scale
         for layer in self.layers:
             x = layer(x)
-            # P0 FIX: Removed nan_to_num - it breaks gradient flow (PyTorch Issue #94700)
-            # If NaN occurs, we should fix root cause, not mask it
         x = self.norm_f(x)
-        # P0 FIX: Removed nan_to_num here as well
-        logits = self.lm_head(x) * self.output_scale
+        # FIX: No output_scale multiplication - logits are already properly scaled
+        logits = self.lm_head(x)
         return logits

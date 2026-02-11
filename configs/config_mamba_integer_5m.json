@@ -1,0 +1,36 @@
+{
+  "architectures": [
+    "MambaInteger5M"
+  ],
+  "d_model": 128,
+  "n_layer": 4,
+  "vocab_size": 8192,
+  "ssm_cfg": {
+    "d_state": 16,
+    "dt_rank": 8,
+    "dt_min": 0.001,
+    "dt_max": 0.1,
+    "use_dyadic_scan": true,
+    "scale_bits": 15,
+    "n_heads": 4,
+    "d_head": 16,
+    "use_ssd": false
+  },
+  "training": {
+    "seq_len": 256,
+    "batch_size": 256,
+    "gradient_accumulation_steps": 1,
+    "total_steps": 5000,
+    "learning_rate": 1e-3,
+    "decay_lr": 1e-3,
+    "weight_decay": 0.01,
+    "grad_clip": 5.0,
+    "num_workers": 4
+  },
+  "rms_norm_eps": 1e-05,
+  "use_bitshift_norm": true,
+  "use_square_activation": true,
+  "weight_quantization": "bitnet_1.58",
+  "model_type": "mamba_integer",
+  "model_name": "mamba_integer_5m"
+}

@@ -7,7 +7,8 @@ import copy
 
 # Add necessary paths
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../gemma-intelligent/conv/src/bitnet-odp/src'))
+# gemma-intelligent dependency removed - rational_bitnet is in src/
+
 
 from mamba_integer_model import MambaIntegerBlock
 import rational_bitnet

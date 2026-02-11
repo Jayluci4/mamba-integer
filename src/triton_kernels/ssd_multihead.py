@@ -78,13 +78,13 @@ def build_causal_decay_matrix_multihead(A_cumsum):
     log_diff = log_diff.masked_fill(~causal_mask, float('-inf'))
 
     # Clamp log_diff for numerical stability before exp
-    log_diff = torch.clamp(log_diff, min=-100.0, max=100.0)
+    log_diff = torch.clamp(log_diff, min=-88.0, max=88.0)
 
     # Exponentiate (upper triangle becomes 0)
     L = torch.exp(log_diff)
 
     # Ensure no NaN/Inf
-    L = torch.nan_to_num(L, nan=0.0, posinf=1.0, neginf=0.0)
+    L = torch.nan_to_num(L, nan=0.0, posinf=0.0, neginf=0.0)
 
     return L
 
@@ -508,7 +508,7 @@ class MambaIntegerBlockV2(nn.Module):
         y = Y.reshape(batch, seqlen, self.d_inner)
 
         # Clamp for stability before gating
-        y = torch.clamp(y, -100.0, 100.0)
+        y = torch.clamp(y, -88.0, 88.0)
 
         # Gate with z
         y = y * _sigmoid_gate(z)
@@ -517,7 +517,7 @@ class MambaIntegerBlockV2(nn.Module):
         out = self.out_proj(y)
 
         # Clamp output for stability
-        out = torch.clamp(out, -100.0, 100.0)
+        out = torch.clamp(out, -88.0, 88.0)
 
         return residual + out * self.res_gate
 

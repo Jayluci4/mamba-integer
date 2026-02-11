@@ -27,6 +27,7 @@ import triton.language as tl
 
 # --- Helper: Compute decay matrix L for a chunk ---
 # L[i,j] = cumulative product of decays from j+1 to i
+# NOTE: Dead code - not used in current implementation. See ssd_multihead.py for working version.
 
 @triton.jit
 def compute_chunk_decay_matrix(
@@ -409,7 +410,7 @@ def ssd_chunked_scan_forward(u, nums, shifts, chunk_size=64):
     else:
         shift_val = 15
 
-    # Launch kernel
+    # Launch kernel (computes intra-chunk scan; each program handles one (b,d) pair)
     grid = (B, D)
     ssd_intra_chunk_matmul_kernel[grid](
         u, nums, h, final_h, decay_to_end,
@@ -418,6 +419,31 @@ def ssd_chunked_scan_forward(u, nums, shifts, chunk_size=64):
         B, L, D,
         chunk_size, shift_val,
     )
+
+    # Inter-chunk state propagation (correction pass)
+    # The kernel processes chunks sequentially per (b,d) program and carries
+    # h_prev between chunks internally. However, to guard against scalar
+    # carry issues across Triton loop iterations, we apply a correction pass
+    # using the stored per-chunk final states and decay-to-end values.
+    #
+    # For chunk c, every position t needs:
+    #   h_corrected[t] = h_intra[t] + cumul_decay(chunk_start..t) * h_end[c-1]
+    # where h_end[c-1] is the corrected final state of the previous chunk.
+    scale = 1.0 / (1 << shift_val)
+    for c in range(1, n_chunks):
+        c_start = c * chunk_size
+        c_end = min((c + 1) * chunk_size, L)
+        # Compute per-position cumulative decay from chunk start
+        chunk_nums = nums[:, c_start:c_end, :].float()  # [B, chunk_len, D]
+        chunk_decay = chunk_nums * scale
+        # cumul_decay[t] = prod(decay[c_start..c_start+t]) for position t in chunk
+        cumul_decay_pos = torch.cumprod(chunk_decay, dim=1)  # [B, chunk_len, D]
+        # Contribution from previous chunk's final state
+        h_prev_chunk = final_h[:, c - 1, :].unsqueeze(1)  # [B, 1, D]
+        correction = cumul_decay_pos * h_prev_chunk
+        h[:, c_start:c_end, :] += correction
+        # Update final_h for this chunk to include the correction
+        final_h[:, c, :] = final_h[:, c, :] + decay_to_end[:, c, :] * final_h[:, c - 1, :]
 
     return h, final_h, decay_to_end
 
@@ -457,6 +483,9 @@ def ssd_intra_chunk_backward_kernel(
 
     # Process chunks in reverse order
     grad_h_acc = 0.0
+    # decay_next holds decay[t+1] from the previous backward iteration,
+    # used to propagate gradient: grad_u[t] = grad_y[t] + decay[t+1] * grad_u[t+1]
+    decay_next = 0.0
 
     for chunk_idx in range(n_chunks - 1, -1, -1):
         chunk_start = chunk_idx * CHUNK_SIZE
@@ -471,8 +500,10 @@ def ssd_intra_chunk_backward_kernel(
                 num_t = tl.load(nums_ptr + ptr).to(tl.float32)
                 decay_t = num_t * scale
 
-                # Accumulate gradient
-                grad_h_acc = grad_h_acc + grad_y_t
+                # For backward scan (t from T-1 to 0):
+                # grad_u[t] = grad_y[t] + decay[t+1] * grad_u[t+1]
+                # decay_next holds decay[t+1] from the previously processed position
+                grad_h_acc = grad_y_t + decay_next * grad_h_acc
 
                 # grad_u[t] = grad_h_acc
                 tl.store(grad_u_ptr + ptr, grad_h_acc)
@@ -490,8 +521,8 @@ def ssd_intra_chunk_backward_kernel(
                 grad_num_t = grad_h_acc * h_prev * scale
                 tl.store(grad_nums_ptr + ptr, grad_num_t)
 
-                # Propagate gradient: grad_h_acc[t-1] = decay[t] * grad_h_acc[t]
-                grad_h_acc = decay_t * grad_h_acc
+                # Save current decay for the next iteration (which processes t-1)
+                decay_next = decay_t
 
 
 def ssd_chunked_scan_backward(grad_h, h, u, nums, shifts, chunk_size=64):

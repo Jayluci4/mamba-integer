@@ -48,7 +48,7 @@ def build_causal_decay_matrix(decay: torch.Tensor, chunk_size: int) -> torch.Ten
     # Build cumulative product matrix
     # L[i,j] = prod(decay[j+1:i+1]) = cumsum of log(decay)
     # For numerical stability, we work in log space
-    log_decay = torch.log(decay_chunks.clamp(min=1e-6))  # [B, num_chunks, D, chunk_size]
+    log_decay = torch.log(decay_chunks.clamp(min=1e-6, max=1.0 - 1e-6))  # [B, num_chunks, D, chunk_size]
 
     # Cumulative sum gives log of cumulative product
     log_cumsum = torch.cumsum(log_decay, dim=-1)  # [B, num_chunks, D, chunk_size]
@@ -70,7 +70,7 @@ def build_causal_decay_matrix(decay: torch.Tensor, chunk_size: int) -> torch.Ten
     # L[i,j] = exp(log_cumsum[i] - log_cumsum[j]) for i > j
     # L[i,i] = 1
     log_diff = log_cumsum_expanded - log_cumsum_j  # [B, num_chunks, D, cs, cs]
-    L = torch.exp(log_diff) * causal_mask
+    L = torch.exp(log_diff.clamp(min=-88.0, max=0.0)) * causal_mask
 
     # For i == j, we want contribution from u[j] without decay
     # But our formula gives L[i,i] = exp(0) = 1, which is correct for the input weight
@@ -132,8 +132,8 @@ def ssd_chunk_forward(u: torch.Tensor, decay: torch.Tensor, chunk_size: int = 64
     # where decay_prod = product of all decays in the chunk
 
     # Compute decay product for each chunk
-    decay_log_sum = torch.log(decay_chunks.clamp(min=1e-6)).sum(dim=2)  # [B, num_chunks, D]
-    decay_prod = torch.exp(decay_log_sum)  # [B, num_chunks, D]
+    decay_log_sum = torch.log(decay_chunks.clamp(min=1e-6, max=1.0 - 1e-6)).sum(dim=2)  # [B, num_chunks, D]
+    decay_prod = torch.exp(decay_log_sum.clamp(min=-88.0, max=0.0))  # [B, num_chunks, D]
 
     # Extract final state from each chunk's intra computation
     h_chunk_final = h_intra[:, :, :, -1]  # [B, num_chunks, D]
@@ -152,15 +152,17 @@ def ssd_chunk_forward(u: torch.Tensor, decay: torch.Tensor, chunk_size: int = 64
     # For position i in chunk c, add h_inter[c] * decay_from_start_of_chunk_to_i
     # decay_from_start[i] = product of decay[0:i] within chunk
 
-    decay_chunks_t = decay_chunks.permute(0, 1, 3, 2)  # [B, num_chunks, D, cs]
-    log_decay_cumsum = torch.cumsum(torch.log(decay_chunks_t.clamp(min=1e-6)), dim=-1)
-    decay_from_start = torch.exp(log_decay_cumsum)  # [B, num_chunks, D, cs]
+    log_decay_cumsum = torch.cumsum(torch.log(decay_chunks.clamp(min=1e-6, max=1.0 - 1e-6)), dim=2)
+    decay_from_start = torch.exp(log_decay_cumsum.clamp(min=-88.0, max=0.0))  # [B, num_chunks, cs, D]
 
     # h_inter contribution: h_inter[c] * decay_from_start
-    h_inter_contrib = h_inter.unsqueeze(-1) * decay_from_start  # [B, num_chunks, D, cs]
+    # h_inter is [B, num_chunks, D], decay_from_start is [B, num_chunks, cs, D]
+    h_inter_contrib = h_inter.unsqueeze(2) * decay_from_start  # [B, num_chunks, cs, D]
 
     # Final output
-    h_chunks = h_intra + h_inter_contrib  # [B, num_chunks, D, cs]
+    # h_intra is [B, num_chunks, D, cs], h_inter_contrib is [B, num_chunks, cs, D]
+    # Transpose h_inter_contrib to match h_intra's layout
+    h_chunks = h_intra + h_inter_contrib.permute(0, 1, 3, 2)  # [B, num_chunks, D, cs]
 
     # Reshape back: [B, num_chunks, D, cs] -> [B, L, D]
     h = h_chunks.permute(0, 1, 3, 2).reshape(B, L, D)
