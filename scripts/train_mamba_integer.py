@@ -508,10 +508,13 @@ def train():
                         for issue in issues:
                             print(f"  - {issue}")
 
-                        # If optimizer is corrupted, skip this checkpoint
-                        if any("Optimizer" in i or "optimizer" in i for i in issues):
-                            print(f"Skipping checkpoint due to optimizer issues. Trying earlier checkpoint...")
+                        # Only skip for NaN/Inf in model weights (critical)
+                        # Optimizer issues are OK — we create a fresh optimizer anyway
+                        critical = [i for i in issues if 'NaN' in i or 'Inf' in i]
+                        if critical:
+                            print(f"Skipping checkpoint due to weight corruption. Trying earlier...")
                             continue
+                        print(f"Non-critical issues only (optimizer state) — proceeding with fresh optimizer.")
 
                     # Load model state
                     model.load_state_dict(checkpoint["model_state_dict"], strict=False)
