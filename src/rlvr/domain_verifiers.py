@@ -495,12 +495,44 @@ class MathVerifier(VerifiableReward):
     def name(self) -> str:
         return "math"
 
+    @staticmethod
+    def _normalize_latex(expr: str) -> str:
+        """Normalize LaTeX math expressions to plain arithmetic."""
+        # \frac{a}{b} → (a)/(b)
+        expr = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", expr)
+        # \dfrac, \tfrac variants
+        expr = re.sub(r"\\[dt]frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", expr)
+        # \left, \right, \, spacing — just remove
+        expr = re.sub(r"\\(?:left|right|,|;|!|quad|qquad)\s*", "", expr)
+        # \pi → pi, \infty → oo (sympy names)
+        expr = expr.replace("\\pi", "pi").replace("\\infty", "oo")
+        return expr.strip()
+
+    @staticmethod
+    def _extract_boxed(text: str) -> Optional[str]:
+        """Extract content from \\boxed{...} handling nested braces."""
+        idx = text.find("\\boxed{")
+        if idx == -1:
+            return None
+        start = idx + len("\\boxed{")
+        depth = 1
+        i = start
+        while i < len(text) and depth > 0:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            return text[start : i - 1]
+        return None
+
     def _extract_answer(self, text: str) -> Optional[str]:
         """Extract mathematical answer from text."""
-        # LaTeX boxed
-        boxed = re.search(r"\\boxed\{([^}]+)\}", text)
-        if boxed:
-            return boxed.group(1)
+        # LaTeX boxed (handles nested braces like \frac{a}{b})
+        boxed = self._extract_boxed(text)
+        if boxed is not None:
+            return self._normalize_latex(boxed)
 
         # Common answer patterns — capture expressions, not just numbers
         # Use sentence boundary that doesn't match decimal points (period followed by digit)
@@ -514,7 +546,7 @@ class MathVerifier(VerifiableReward):
         for pattern in patterns:
             match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
             if match:
-                candidate = match.group(1).strip().rstrip(".")
+                candidate = self._normalize_latex(match.group(1).strip().rstrip("."))
                 # Must contain at least one digit or algebraic variable
                 if re.search(r"[\dx]", candidate):
                     return candidate
@@ -530,8 +562,9 @@ class MathVerifier(VerifiableReward):
         """Parse string to SymPy expression."""
         import sympy
         try:
-            # Clean LaTeX artifacts
-            expr_str = expr_str.replace("\\frac", "")
+            # Normalize LaTeX fractions first
+            expr_str = self._normalize_latex(expr_str)
+            # Clean remaining LaTeX artifacts
             expr_str = expr_str.replace("\\cdot", "*")
             expr_str = expr_str.replace("\\times", "*")
             expr_str = expr_str.replace("\\div", "/")
@@ -543,19 +576,28 @@ class MathVerifier(VerifiableReward):
             return None
 
     def _numeric_equal(self, a_str: str, b_str: str) -> bool:
-        """Check numeric equality with tolerance."""
+        """Check numeric equality with tolerance (absolute and relative)."""
         try:
             from fractions import Fraction
 
             def to_float(s):
                 s = s.strip()
+                # Handle parenthesized fractions from _normalize_latex: (a)/(b)
+                m = re.match(r"^\(([^)]+)\)/\(([^)]+)\)$", s)
+                if m:
+                    return float(Fraction(f"{m.group(1)}/{m.group(2)}"))
                 if "/" in s:
                     return float(Fraction(s))
                 return float(s)
 
             a_val = to_float(a_str)
             b_val = to_float(b_str)
-            return abs(a_val - b_val) <= self.tolerance
+            # Absolute tolerance
+            if abs(a_val - b_val) <= self.tolerance:
+                return True
+            # Relative tolerance for rounded decimals (e.g., 1.4167 vs 17/12)
+            denom = max(abs(a_val), abs(b_val), 1e-10)
+            return abs(a_val - b_val) / denom <= 1e-3
         except (ValueError, ZeroDivisionError):
             return False
 

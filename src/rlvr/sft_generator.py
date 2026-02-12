@@ -154,6 +154,150 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. Provide clear, accurate, and well-structured responses."
 )
 
+# Comprehensive default SQL schema for SQLVerifier execution.
+# Covers the most common tables referenced in generated SQL prompts so that
+# queries can be executed in SQLite even when no per-prompt schema is supplied.
+_DEFAULT_SQL_SCHEMA = """
+CREATE TABLE employees (
+    id INTEGER PRIMARY KEY, name TEXT, department TEXT, salary REAL,
+    hire_date TEXT, manager_id INTEGER, email TEXT, position TEXT
+);
+INSERT INTO employees VALUES
+    (1,'Alice','Engineering',95000,'2020-01-15',NULL,'alice@co.com','Senior Engineer'),
+    (2,'Bob','Engineering',85000,'2021-03-20',1,'bob@co.com','Engineer'),
+    (3,'Carol','Sales',75000,'2019-06-10',NULL,'carol@co.com','Sales Manager'),
+    (4,'Dave','Sales',65000,'2022-01-05',3,'dave@co.com','Sales Rep'),
+    (5,'Eve','HR',70000,'2018-11-30',NULL,'eve@co.com','HR Director'),
+    (6,'Frank','Engineering',90000,'2020-07-22',1,'frank@co.com','Engineer'),
+    (7,'Grace','Marketing',72000,'2021-09-01',NULL,'grace@co.com','Marketing Lead'),
+    (8,'Heidi','Sales',68000,'2023-02-14',3,'heidi@co.com','Sales Rep');
+
+CREATE TABLE customers (
+    id INTEGER PRIMARY KEY, name TEXT, email TEXT, city TEXT,
+    country TEXT, created_at TEXT, tier TEXT
+);
+INSERT INTO customers VALUES
+    (1,'Acme Corp','acme@example.com','New York','US','2020-01-10','gold'),
+    (2,'Globex','globex@example.com','London','UK','2020-03-15','silver'),
+    (3,'Initech','initech@example.com','Austin','US','2021-06-20','gold'),
+    (4,'Umbrella','umbrella@example.com','Tokyo','JP','2021-09-01','bronze'),
+    (5,'Stark Industries','stark@example.com','New York','US','2022-01-05','gold');
+
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY, customer_id INTEGER, amount REAL,
+    order_date TEXT, status TEXT, product_id INTEGER,
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+INSERT INTO orders VALUES
+    (1,1,5000,'2023-01-15','completed',1),(2,1,3000,'2023-02-20','completed',2),
+    (3,2,7500,'2023-01-25','completed',1),(4,3,2000,'2023-03-10','pending',3),
+    (5,4,4500,'2023-02-28','completed',2),(6,5,6000,'2023-03-15','shipped',1),
+    (7,1,1500,'2023-04-01','completed',3),(8,3,8000,'2023-04-10','completed',1);
+
+CREATE TABLE products (
+    id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL,
+    stock INTEGER, created_at TEXT
+);
+INSERT INTO products VALUES
+    (1,'Widget A','Electronics',49.99,500,'2020-01-01'),
+    (2,'Widget B','Electronics',29.99,1000,'2020-06-01'),
+    (3,'Gadget C','Tools',19.99,750,'2021-01-01'),
+    (4,'Gadget D','Tools',39.99,200,'2021-06-01'),
+    (5,'Service E','Services',99.99,NULL,'2022-01-01');
+
+CREATE TABLE departments (
+    id INTEGER PRIMARY KEY, name TEXT, budget REAL, location TEXT
+);
+INSERT INTO departments VALUES
+    (1,'Engineering',500000,'Building A'),(2,'Sales',300000,'Building B'),
+    (3,'HR',150000,'Building A'),(4,'Marketing',200000,'Building C');
+
+CREATE TABLE sales (
+    id INTEGER PRIMARY KEY, product_id INTEGER, customer_id INTEGER,
+    quantity INTEGER, total REAL, sale_date TEXT, region TEXT,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+INSERT INTO sales VALUES
+    (1,1,1,10,499.90,'2023-01-15','East'),(2,2,2,20,599.80,'2023-02-01','West'),
+    (3,3,3,15,299.85,'2023-02-15','East'),(4,1,4,5,249.95,'2023-03-01','West'),
+    (5,4,5,8,319.92,'2023-03-15','East'),(6,2,1,30,899.70,'2023-04-01','East');
+
+CREATE TABLE students (
+    id INTEGER PRIMARY KEY, name TEXT, grade REAL, major TEXT,
+    enrollment_date TEXT, gpa REAL
+);
+INSERT INTO students VALUES
+    (1,'Student A',90,'CS','2020-09-01',3.8),(2,'Student B',85,'Math','2020-09-01',3.5),
+    (3,'Student C',92,'CS','2021-09-01',3.9),(4,'Student D',78,'English','2021-09-01',3.2);
+
+CREATE TABLE transactions (
+    id INTEGER PRIMARY KEY, account_id INTEGER, amount REAL,
+    transaction_date TEXT, type TEXT, description TEXT
+);
+INSERT INTO transactions VALUES
+    (1,101,500.00,'2023-01-15','credit','Deposit'),
+    (2,101,-200.00,'2023-01-20','debit','Withdrawal'),
+    (3,102,1000.00,'2023-02-01','credit','Deposit'),
+    (4,102,-350.00,'2023-02-10','debit','Payment');
+
+CREATE TABLE inventory (
+    id INTEGER PRIMARY KEY, product_id INTEGER, warehouse TEXT,
+    quantity INTEGER, last_updated TEXT,
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+INSERT INTO inventory VALUES
+    (1,1,'Warehouse A',200,'2023-04-01'),(2,2,'Warehouse A',500,'2023-04-01'),
+    (3,1,'Warehouse B',300,'2023-04-01'),(4,3,'Warehouse B',750,'2023-04-01');
+
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY, username TEXT, email TEXT,
+    role TEXT, active INTEGER, last_login TEXT
+);
+INSERT INTO users VALUES
+    (1,'admin','admin@co.com','admin',1,'2023-04-15'),
+    (2,'jdoe','jdoe@co.com','user',1,'2023-04-14'),
+    (3,'jsmith','jsmith@co.com','user',0,'2023-01-01');
+
+CREATE TABLE reviews (
+    id INTEGER PRIMARY KEY, product_id INTEGER, customer_id INTEGER,
+    rating INTEGER, comment TEXT, review_date TEXT,
+    FOREIGN KEY (product_id) REFERENCES products(id),
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+INSERT INTO reviews VALUES
+    (1,1,1,5,'Excellent','2023-02-01'),(2,1,2,4,'Good quality','2023-02-15'),
+    (3,2,3,3,'Average','2023-03-01'),(4,3,1,5,'Perfect','2023-03-15');
+
+CREATE TABLE payments (
+    id INTEGER PRIMARY KEY, order_id INTEGER, amount REAL,
+    payment_date TEXT, method TEXT,
+    FOREIGN KEY (order_id) REFERENCES orders(id)
+);
+INSERT INTO payments VALUES
+    (1,1,5000,'2023-01-16','credit_card'),(2,2,3000,'2023-02-21','bank_transfer'),
+    (3,3,7500,'2023-01-26','credit_card'),(4,5,4500,'2023-03-01','paypal');
+
+CREATE TABLE invoices (
+    id INTEGER PRIMARY KEY, customer_id INTEGER, total REAL,
+    issue_date TEXT, due_date TEXT, paid INTEGER,
+    FOREIGN KEY (customer_id) REFERENCES customers(id)
+);
+INSERT INTO invoices VALUES
+    (1,1,8000,'2023-01-15','2023-02-15',1),(2,2,7500,'2023-01-25','2023-02-25',1),
+    (3,3,2000,'2023-03-10','2023-04-10',0),(4,5,6000,'2023-03-15','2023-04-15',0);
+
+CREATE TABLE logs (
+    id INTEGER PRIMARY KEY, event TEXT, user_id INTEGER,
+    timestamp TEXT, level TEXT
+);
+INSERT INTO logs VALUES
+    (1,'login',1,'2023-04-15 08:00:00','INFO'),
+    (2,'login',2,'2023-04-14 09:00:00','INFO'),
+    (3,'error',2,'2023-04-14 09:05:00','ERROR'),
+    (4,'logout',1,'2023-04-15 17:00:00','INFO');
+"""
+
 
 # =============================================================================
 # VLLM CLIENT
@@ -258,11 +402,22 @@ class SFTGenerator:
             "total_time_ms": 0.0,
         }
 
-    def _get_verifier(self, domain: str) -> VerifiableReward:
-        """Get or create a cached verifier for the domain."""
-        if domain not in self._verifier_cache:
-            self._verifier_cache[domain] = create_verifier(domain)
-        return self._verifier_cache[domain]
+    def _get_verifier(self, domain: str, schema: Optional[str] = None) -> VerifiableReward:
+        """Get or create a cached verifier for the domain.
+
+        For SQL domain, a comprehensive default schema is used so that
+        generated queries can execute against realistic tables. Per-prompt
+        schemas (from ground_truth) override the default.
+        """
+        cache_key = domain if schema is None else f"{domain}:{hashlib.md5(schema.encode()).hexdigest()[:8]}"
+        if cache_key not in self._verifier_cache:
+            if domain == "sql":
+                self._verifier_cache[cache_key] = create_verifier(
+                    domain, schema=schema or _DEFAULT_SQL_SCHEMA
+                )
+            else:
+                self._verifier_cache[cache_key] = create_verifier(domain)
+        return self._verifier_cache[cache_key]
 
     def _init_domain_stats(self, domain: str) -> None:
         """Initialize per-domain stats if needed."""
@@ -314,7 +469,19 @@ class SFTGenerator:
         Returns:
             SFTGenerationResult with best response (verified or not)
         """
-        verifier = self._get_verifier(domain)
+        # For SQL, check if ground_truth contains a per-prompt schema
+        sql_schema = None
+        verify_ground_truth = ground_truth
+        if domain == "sql" and ground_truth:
+            try:
+                gt_parsed = json.loads(ground_truth)
+                if isinstance(gt_parsed, dict) and "schema" in gt_parsed:
+                    sql_schema = gt_parsed["schema"]
+                    verify_ground_truth = None  # schema isn't a verification target
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        verifier = self._get_verifier(domain, schema=sql_schema)
         threshold = self.config.get_reward_threshold(domain)
         start_time = time.time()
 
@@ -335,7 +502,7 @@ class SFTGenerator:
                 for resp in responses:
                     n_attempts += 1
                     try:
-                        reward_result = verifier.compute(prompt, resp, ground_truth)
+                        reward_result = verifier.compute(prompt, resp, verify_ground_truth)
                     except Exception as e:
                         logger.warning(f"Verifier error: {e}")
                         continue
@@ -375,7 +542,7 @@ class SFTGenerator:
             for resp in responses:
                 n_attempts += 1
                 try:
-                    reward_result = verifier.compute(prompt, resp, ground_truth)
+                    reward_result = verifier.compute(prompt, resp, verify_ground_truth)
                 except Exception as e:
                     logger.warning(f"Verifier error: {e}")
                     continue
