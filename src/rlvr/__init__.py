@@ -3,6 +3,7 @@
 
 from .rewards import (
     VerifiableReward,
+    RewardResult,
     ArithmeticReward,
     CodeExecutionReward,
     LogicReward,
@@ -17,9 +18,31 @@ from .zk_rewards import (
     ZKDyadicRationalReward,
     ZKCompositeReward,
 )
+from .domain_verifiers import (
+    SolidityVerifier,
+    SQLVerifier,
+    MathVerifier,
+    SECFinanceVerifier,
+    EnglishVerifier,
+    IVGRPOReward,
+    create_verifier,
+    create_iv_grpo_verifier,
+)
+from .iv_grpo import (
+    IVGRPOConfig,
+    IVGRPOTrainer,
+    DomainDataset,
+    MultiDomainIVGRPOTrainer,
+)
+from .sft_generator import (
+    SFTGenerationConfig,
+    SFTGenerator,
+    SFTGenerationResult,
+)
 
 __all__ = [
     "VerifiableReward",
+    "RewardResult",
     "ArithmeticReward",
     "CodeExecutionReward",
     "LogicReward",
@@ -33,4 +56,19 @@ __all__ = [
     "ZKIntegerArithmeticReward",
     "ZKDyadicRationalReward",
     "ZKCompositeReward",
+    "SolidityVerifier",
+    "SQLVerifier",
+    "MathVerifier",
+    "SECFinanceVerifier",
+    "EnglishVerifier",
+    "IVGRPOReward",
+    "create_verifier",
+    "create_iv_grpo_verifier",
+    "IVGRPOConfig",
+    "IVGRPOTrainer",
+    "DomainDataset",
+    "MultiDomainIVGRPOTrainer",
+    "SFTGenerationConfig",
+    "SFTGenerator",
+    "SFTGenerationResult",
 ]
