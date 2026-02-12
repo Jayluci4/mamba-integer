@@ -705,7 +705,7 @@ def train():
             last_valid_loss = loss_val
 
         # Regular logging (also log first 5 steps for timing estimates)
-        if opt_step % log_interval == 0 or opt_step < 5 or opt_step == total_opt_steps - 1:
+        if opt_step % log_interval == 0 or opt_step < 5 or (opt_step - start_step) < 5 or opt_step == total_opt_steps - 1:
             current_lr = scheduler.get_last_lr()[0]
             total_elapsed = time.time() - start_time
             print(f"Step {opt_step}/{total_opt_steps} | Loss: {loss_val:.4f} | LR: {current_lr:.2e} | GradNorm: {grad_norm:.2f} | SeqLen: {curr_seq_len} | Time/step: {elapsed:.2f}s | Total: {total_elapsed/60:.1f}min", flush=True)

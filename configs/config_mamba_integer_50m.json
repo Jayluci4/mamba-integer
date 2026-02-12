@@ -29,7 +29,7 @@
     "num_workers": 0,
     "log_interval": 500,
     "checkpoint_interval": 10000,
-    "use_amp": false,
+    "use_amp": true,
     "use_compile": false
   },
   "rms_norm_eps": 1e-05,

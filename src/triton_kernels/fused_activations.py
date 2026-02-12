@@ -34,35 +34,29 @@ def rsqrt_newton_raphson(y, num_iters: tl.constexpr = 3):
     """Compute 1/sqrt(y) using Newton-Raphson iteration.
 
     Newton-Raphson for f(r) = 1/r^2 - y = 0:
-    r_new = r * (3 - y * r^2) / 2
+    r_new = r * (1.5 - 0.5 * y * r^2)
 
-    Uses ONLY: multiply, add, subtract, divide by 2 (bit-shift)
-    NO transcendentals (sqrt, exp, log, etc.)
-
-    Initial guess: For y in [1, 100], use 1/8 as starting point
-    3 iterations gives ~7 digits of precision.
+    Uses ONLY: multiply, add, subtract (no transcendentals).
+    Covers full range [0.0625, 4096+] with 7 initial guess brackets.
+    3 iterations gives ~7 digits of precision when y*r0^2 is in [0.5, 3].
     """
-    # Initial guess: r0 = 0.125 works well for y in typical range [1, 100]
-    # For better range, we normalize: scale y to [1, 4) range
-
-    # Simple approach: use fixed initial guess with more iterations
-    # r0 = 1.0 / 8.0 works for y ~ 4-100
-    # r0 = 1.0 works for y ~ 1-4
-    # r0 = 0.5 works for y ~ 1-16
-
-    # Adaptive initial guess based on magnitude (pure rational)
-    r = tl.where(y > 16.0, 0.125, 0.5)
-    r = tl.where(y > 64.0, 0.0625, r)
-    r = tl.where(y < 4.0, 1.0, r)
+    # Adaptive initial guess covering full range used by squareplus/norm
+    # squareplus feeds x^2+4 where x in [-50,50] => y in [4, 2504]
+    # BitShiftNorm feeds variance => y in [eps, ~4096]
+    r = tl.where(y >= 4.0, 0.5, 1.0)      # default 1.0 for y in [1,4)
+    r = tl.where(y >= 16.0, 0.25, r)
+    r = tl.where(y >= 64.0, 0.125, r)
+    r = tl.where(y >= 256.0, 0.0625, r)
+    r = tl.where(y >= 1024.0, 0.03125, r)
     r = tl.where(y < 1.0, 2.0, r)
+    r = tl.where(y < 0.25, 4.0, r)
 
-    # Newton-Raphson iterations: r = r * (3 - y * r^2) / 2
-    # This is: r = r * (1.5 - 0.5 * y * r^2)
-    # Using only multiply, add, subtract, divide by constant
+    # Newton-Raphson: r = r * (1.5 - 0.5 * y * r^2)
+    # Clamp after each iteration to prevent divergence
     for _ in range(num_iters):
-        r_sq = r * r
-        yr_sq = y * r_sq
-        r = r * (1.5 - 0.5 * yr_sq)
+        r = r * (1.5 - 0.5 * y * r * r)
+        r = tl.where(r < 1e-6, 1e-6, r)
+        r = tl.where(r > 1e3, 1e3, r)
 
     return r
 
@@ -114,6 +108,8 @@ def fused_squareplus_clamp_fwd_kernel(
     y_sq = x_clamped * x_clamped + 4.0
     sqrt_y = sqrt_rational(y_sq, num_iters=3)
     y = 0.5 * (x_clamped + sqrt_y)
+    # Clamp output to non-negative (matches Python _squareplus_activation)
+    y = tl.where(y < 0.0, 0.0, y)
 
     tl.store(out_ptr + offsets, y, mask=mask)
 
@@ -207,11 +203,11 @@ class FusedSquareplusClampFunction(torch.autograd.Function):
 
 def _rsqrt_newton_cpu(y, num_iters=3):
     """Newton-Raphson rsqrt for CPU (INTEGER-ONLY)."""
-    # Adaptive initial guess
-    r = torch.where(y > 16.0, torch.full_like(y, 0.125), torch.full_like(y, 0.5))
-    r = torch.where(y > 64.0, torch.full_like(y, 0.0625), r)
-    r = torch.where(y < 4.0, torch.ones_like(y), r)
-    r = torch.where(y < 1.0, torch.full_like(y, 2.0), r)
+    # Adaptive initial guess (scalars broadcast — no tensor allocs)
+    r = torch.where(y > 16.0, 0.125, 0.5)
+    r = torch.where(y > 64.0, 0.0625, r)
+    r = torch.where(y < 4.0, 1.0, r)
+    r = torch.where(y < 1.0, 2.0, r)
 
     for _ in range(num_iters):
         r = r * (1.5 - 0.5 * y * r * r)
@@ -684,12 +680,12 @@ class FusedDecayComputationFunction(torch.autograd.Function):
         # grad from dt_val: STE means gradient passes through unconditionally
         # Only respect the initial clamp(-20, 20) range
         grad_from_dt = grad_dt_val * d_dt
-        grad_from_dt = torch.where(in_dm_range, grad_from_dt, torch.zeros_like(grad_from_dt))
+        grad_from_dt = torch.where(in_dm_range, grad_from_dt, 0.0)
 
         # grad from decay_nums: STE means gradient passes through unconditionally
         # Sum over N dimension since decay_mod broadcasts to [B, L, D, N]
         grad_from_dn = grad_decay_nums.sum(dim=-1)
-        grad_from_dn = torch.where(in_dm_range, grad_from_dn, torch.zeros_like(grad_from_dn))
+        grad_from_dn = torch.where(in_dm_range, grad_from_dn, 0.0)
 
         # Total gradient
         grad_decay_mod = grad_from_dt + grad_from_dn

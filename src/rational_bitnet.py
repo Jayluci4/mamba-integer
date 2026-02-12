@@ -74,13 +74,20 @@ def weight_quant_ternary(w: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     - Prevents "Distribution Collapse" where small weights cause scale → 0
     - If scale drops too low, all quantized weights snap to zero → capacity loss
     - Clamp at 1e-6 ensures meaningful ternary quantization
-    """
-    # AbsMean scaling with MINIMUM SCALE CLAMP (prevents distribution collapse)
-    scale = w.abs().mean().clamp(min=1e-6)
 
-    # Normalize and round to {-1, 0, 1}
-    w_normalized = w / scale
-    w_quant = torch.clamp(ste_round(w_normalized), min=-1, max=1)
+    PRECISION FIX: Force FP32 for boundary computation.
+    bf16's 7-bit mantissa loses precision at ternary boundaries (±0.5*scale),
+    causing gradient corruption and training stalls after ~30k steps.
+    """
+    # Force FP32 for quantization boundary math — critical for STE gradient precision
+    with torch.amp.autocast('cuda', enabled=False):
+        w_fp32 = w.float()
+        # AbsMean scaling with MINIMUM SCALE CLAMP (prevents distribution collapse)
+        scale = w_fp32.abs().mean().clamp(min=1e-6)
+
+        # Normalize and round to {-1, 0, 1}
+        w_normalized = w_fp32 / scale
+        w_quant = torch.clamp(ste_round(w_normalized), min=-1, max=1)
 
     return w_quant, scale
 
@@ -101,12 +108,15 @@ def activation_quant_dynamic(x: torch.Tensor, bits: int = 8) -> Tuple[torch.Tens
 
     Q_max = (1 << (bits - 1)) - 1  # 127 for 8-bit
 
-    # Fused abs-max computation (more efficient than .abs().max())
-    scale = torch.amax(torch.abs(x), dim=-1, keepdim=True).clamp(min=1e-8)
+    # Force FP32 for quantization scale computation (same precision fix as weights)
+    with torch.amp.autocast('cuda', enabled=False):
+        x_fp32 = x.float()
+        # Fused abs-max computation (more efficient than .abs().max())
+        scale = torch.amax(torch.abs(x_fp32), dim=-1, keepdim=True).clamp(min=1e-8)
 
-    # Fused quantization (combine ops for better fusion)
-    inv_scale = Q_max / scale
-    x_quant = ste_round(x * inv_scale).clamp(-Q_max, Q_max)
+        # Fused quantization (combine ops for better fusion)
+        inv_scale = Q_max / scale
+        x_quant = ste_round(x_fp32 * inv_scale).clamp(-Q_max, Q_max)
 
     return x_quant, scale / Q_max
 
